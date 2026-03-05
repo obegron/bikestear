@@ -485,8 +485,10 @@ class VisionTracker:
         return self._sample_from_frame(frame), frame, dict(self._last_debug)
 
     def next(self) -> PoseSample:
-        sample, _ = self.next_with_frame()
-        return sample
+        ok, frame = self.cap.read()
+        if not ok:
+            return PoseSample(steer_raw=0.0, confidence=0.0, source="camera", ts=monotonic())
+        return self._sample_from_frame(frame)
 
     def close(self) -> None:
         if self.cap:
