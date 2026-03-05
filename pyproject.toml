@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ftms2pad"
+version = "0.1.0"
+description = "FTMS bike + webcam lean steering to Linux virtual gamepad"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+  "PyYAML>=6.0",
+  "numpy>=1.24",
+  "opencv-python>=4.8",
+  "mediapipe>=0.10",
+  "bleak>=0.22",
+  "evdev>=1.7",
+]
+
+[project.scripts]
+ftms2pad = "ftms2pad.cli:main"
+
+[tool.setuptools]
+packages = ["ftms2pad", "ftms2pad.ftms", "ftms2pad.vision", "ftms2pad.fusion", "ftms2pad.uinput", "ftms2pad.profiles"]

@@ -1,0 +1,20 @@
+name: supertuxkart
+steering:
+  mode: torso_combo
+  gain: 1.4
+  deadzone: 0.06
+  smoothing: 0.18
+  invert: false
+throttle:
+  source: watts
+  gain: 0.0025
+  deadzone_watts: 25
+  smoothing: 0.12
+  curve: linear
+uinput:
+  steer_axis: ABS_X
+  throttle_axis: ABS_Y
+  invert_throttle: true
+buttons:
+  gear_plus: BTN_A
+  gear_minus: BTN_B

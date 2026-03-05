@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+*.md
+debug/
+dist/
+ftms2pad.egg-info/
+profiles/*.calibration.json
