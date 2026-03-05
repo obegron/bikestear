@@ -182,6 +182,8 @@ class VisionTracker:
         for (x, y, fw, fh) in frontal:
             cy = y + fh * 0.5
             cx = x + fw * 0.5
+            if cy < h * 0.18:
+                continue
             if cy > h * 0.75:
                 continue
             if fw * fh < (w * h) * 0.002:
@@ -203,6 +205,8 @@ class VisionTracker:
             for (x, y, fw, fh) in prof_l:
                 cy = y + fh * 0.5
                 cx = x + fw * 0.5
+                if cy < h * 0.18:
+                    continue
                 if cy > h * 0.75:
                     continue
                 if fw * fh < (w * h) * 0.0015:
@@ -225,6 +229,8 @@ class VisionTracker:
                 x = w - (int(xf) + int(fw))
                 cy = y + fh * 0.5
                 cx = x + fw * 0.5
+                if cy < h * 0.18:
+                    continue
                 if cy > h * 0.75:
                     continue
                 if fw * fh < (w * h) * 0.0015:
