@@ -241,10 +241,10 @@ class VisionTracker:
             tracked = None
             if self._face_last_bbox is not None and self._face_template is not None:
                 x0, y0, w0, h0 = self._face_last_bbox
-                sx0 = max(0, x0 - int(w0 * 1.2))
-                sy0 = max(0, y0 - int(h0 * 1.2))
-                sx1 = min(w, x0 + w0 + int(w0 * 1.2))
-                sy1 = min(roi_h, y0 + h0 + int(h0 * 1.2))
+                sx0 = max(0, x0 - int(w0 * 0.7))
+                sy0 = max(0, y0 - int(h0 * 0.7))
+                sx1 = min(w, x0 + w0 + int(w0 * 0.7))
+                sy1 = min(roi_h, y0 + h0 + int(h0 * 0.7))
                 if sx1 - sx0 >= w0 and sy1 - sy0 >= h0:
                     search = roi[sy0:sy1, sx0:sx1]
                     tmpl = self._face_template
@@ -260,9 +260,10 @@ class VisionTracker:
                                 cy_prev = y0 + h0 * 0.5
                                 cx_new = tx + tw * 0.5
                                 cy_new = ty + th * 0.5
-                                jump = ((cx_new - cx_prev) ** 2 + (cy_new - cy_prev) ** 2) ** 0.5
+                                dx = abs(cx_new - cx_prev)
+                                dy = abs(cy_new - cy_prev)
                                 top_ok = ty >= int(h * 0.08)
-                                jump_ok = jump <= max(w * 0.18, w0 * 1.1)
+                                jump_ok = dx <= max(w * 0.11, w0 * 1.2) and dy <= max(h * 0.10, h0 * 1.2)
                                 if top_ok and jump_ok:
                                     tracked = (tx, ty, tw, th, float(max_val))
                         except Exception:
@@ -282,7 +283,7 @@ class VisionTracker:
                 }
                 return max(-1.0, min(1.0, raw)), 0.22, debug
             # Short hold to reduce flicker on brief misses.
-            if self._face_last_bbox is not None and (monotonic() - self._face_last_ts) < 1.4:
+            if self._face_last_bbox is not None and (monotonic() - self._face_last_ts) < 2.2:
                 x, y, fw, fh = self._face_last_bbox
                 cx = x + fw * 0.5
                 raw = (0.5 - (cx / max(w, 1))) * 1.6
@@ -319,15 +320,20 @@ class VisionTracker:
         chosen: tuple[int, int, int, int, str] | None = None
         if prev_cx is not None and prev_cy is not None and self._face_last_bbox is not None:
             _, _, prev_w, prev_h = self._face_last_bbox
-            max_jump = max(w * 0.22, max(prev_w, prev_h) * 1.7)
+            prev_area = max(1.0, float(prev_w * prev_h))
+            max_jump_x = max(w * 0.09, prev_w * 1.0)
+            max_jump_y = max(h * 0.08, prev_h * 0.9)
             near = []
             far = []
             for rect in candidates:
-                x, y, fw, fh, _det = rect
+                x, y, fw, fh, det = rect
                 cx = x + fw * 0.5
                 cy = y + fh * 0.5
-                dist = ((cx - prev_cx) ** 2 + (cy - prev_cy) ** 2) ** 0.5
-                if dist <= max_jump:
+                area_ratio = (fw * fh) / prev_area
+                # Reject abrupt tiny frontal detections; these are usually wall/carpet false positives.
+                if det == "frontal" and area_ratio < 0.6:
+                    continue
+                if abs(cx - prev_cx) <= max_jump_x and abs(cy - prev_cy) <= max_jump_y:
                     near.append(rect)
                 else:
                     far.append(rect)

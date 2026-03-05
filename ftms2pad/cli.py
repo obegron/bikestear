@@ -580,6 +580,27 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
         neutral = sum(neutral_samples) / max(len(neutral_samples), 1)
         left_peak = _percentile(left_vals, 0.10) if left_vals else -0.7
         right_peak = _percentile(right_vals, 0.90) if right_vals else 0.7
+        corrections: list[str] = []
+
+        # Calibration safety: if one side never crosses neutral (common when tracking blinks during a phase),
+        # synthesize the missing side from the opposite span so steering stays usable.
+        min_span = 0.08
+        if right_peak <= neutral:
+            fallback = max(abs(neutral - left_peak), min_span)
+            right_peak = neutral + fallback
+            corrections.append("right_peak_auto_fixed")
+        if left_peak >= neutral:
+            fallback = max(abs(right_peak - neutral), min_span)
+            left_peak = neutral - fallback
+            corrections.append("left_peak_auto_fixed")
+
+        # Ensure both sides keep enough dynamic range after corrections.
+        if abs(neutral - left_peak) < min_span:
+            left_peak = neutral - min_span
+            corrections.append("left_span_min_applied")
+        if abs(right_peak - neutral) < min_span:
+            right_peak = neutral + min_span
+            corrections.append("right_span_min_applied")
 
         calib = Calibrator(neutral=neutral, left_peak=left_peak, right_peak=right_peak)
         out = _calibration_path(args.profile)
@@ -588,6 +609,8 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
         print(f"samples neutral={len(neutral_samples)} left={len(left_vals)} right={len(right_vals)}")
         if len(left_vals) < 20 or len(right_vals) < 20:
             print("Warning: low valid samples. Try more light, visible camera (0), or longer phase seconds.")
+        if corrections:
+            print(f"Calibration correction: {', '.join(corrections)}")
         print(f"neutral={neutral:.4f} left_peak={left_peak:.4f} right_peak={right_peak:.4f}")
         return 0
     finally:
