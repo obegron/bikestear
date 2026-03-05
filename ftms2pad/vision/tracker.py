@@ -263,7 +263,9 @@ class VisionTracker:
                                 dx = abs(cx_new - cx_prev)
                                 dy = abs(cy_new - cy_prev)
                                 top_ok = ty >= int(h * 0.08)
-                                jump_ok = dx <= max(w * 0.11, w0 * 1.2) and dy <= max(h * 0.10, h0 * 1.2)
+                                max_tmpl_jump_x = max(w * 0.08, w0 * 0.6)
+                                max_tmpl_jump_y = max(h * 0.07, h0 * 0.55)
+                                jump_ok = dx <= max_tmpl_jump_x and dy <= max_tmpl_jump_y
                                 if top_ok and jump_ok:
                                     tracked = (tx, ty, tw, th, float(max_val))
                         except Exception:
@@ -283,7 +285,7 @@ class VisionTracker:
                 }
                 return max(-1.0, min(1.0, raw)), 0.22, debug
             # Short hold to reduce flicker on brief misses.
-            if self._face_last_bbox is not None and (monotonic() - self._face_last_ts) < 2.2:
+            if self._face_last_bbox is not None and (monotonic() - self._face_last_ts) < 1.0:
                 x, y, fw, fh = self._face_last_bbox
                 cx = x + fw * 0.5
                 raw = (0.5 - (cx / max(w, 1))) * 1.6
@@ -350,7 +352,7 @@ class VisionTracker:
             chosen = max(candidates, key=_score)
 
         if chosen is None:
-            if self._face_last_bbox is not None and (monotonic() - self._face_last_ts) < 1.4:
+            if self._face_last_bbox is not None and (monotonic() - self._face_last_ts) < 0.8:
                 x, y, fw, fh = self._face_last_bbox
                 cx = x + fw * 0.5
                 raw = (0.5 - (cx / max(w, 1))) * 1.6
