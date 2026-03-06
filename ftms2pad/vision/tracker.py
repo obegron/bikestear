@@ -95,7 +95,52 @@ class VisionTracker:
         self._face_last_bbox: tuple[int, int, int, int] | None = None
         self._face_last_ts: float = 0.0
         self._face_template = None
+        self._tracker = None
         self._last_debug: dict[str, object] = {}
+
+    def _create_tracker(self):
+        try:
+            if hasattr(cv2, "legacy"):
+                legacy = cv2.legacy
+                for name in ("TrackerCSRT_create", "TrackerKCF_create", "TrackerMOSSE_create"):
+                    fn = getattr(legacy, name, None)
+                    if callable(fn):
+                        return fn()
+            for name in ("TrackerCSRT_create", "TrackerKCF_create", "TrackerMOSSE_create"):
+                fn = getattr(cv2, name, None)
+                if callable(fn):
+                    return fn()
+        except Exception:
+            return None
+        return None
+
+    def _tracker_init(self, frame, bbox: tuple[int, int, int, int]) -> None:
+        tracker = self._create_tracker()
+        if tracker is None:
+            self._tracker = None
+            return
+        try:
+            ok = tracker.init(frame, tuple(float(v) for v in bbox))
+            self._tracker = tracker if ok is not False else None
+        except Exception:
+            self._tracker = None
+
+    def _tracker_update_bbox(self, frame) -> tuple[int, int, int, int] | None:
+        if self._tracker is None:
+            return None
+        try:
+            ok, box = self._tracker.update(frame)
+            if not ok:
+                self._tracker = None
+                return None
+            x, y, w, h = [int(v) for v in box]
+            if w <= 0 or h <= 0:
+                self._tracker = None
+                return None
+            return x, y, w, h
+        except Exception:
+            self._tracker = None
+            return None
 
     def _pick_camera(self, camera: str) -> int:
         if camera != "auto":
@@ -199,7 +244,7 @@ class VisionTracker:
             prof_l = self._face_profile.detectMultiScale(
                 roi,
                 scaleFactor=1.1,
-                minNeighbors=5,
+                minNeighbors=4,
                 minSize=(max(30, w // 24), max(30, h // 24)),
             )
             for (x, y, fw, fh) in prof_l:
@@ -222,7 +267,7 @@ class VisionTracker:
             prof_r_flip = self._face_profile.detectMultiScale(
                 roi_flip,
                 scaleFactor=1.1,
-                minNeighbors=5,
+                minNeighbors=4,
                 minSize=(max(30, w // 24), max(30, h // 24)),
             )
             for (xf, y, fw, fh) in prof_r_flip:
@@ -243,14 +288,45 @@ class VisionTracker:
                 candidates.append((int(x), int(y), int(fw), int(fh), "profile_r"))
 
         if not candidates:
+            # First try persistent tracker to bridge short face-detector misses while turning.
+            tracked_box = self._tracker_update_bbox(frame)
+            if tracked_box is not None and self._face_last_bbox is not None:
+                x, y, fw, fh = tracked_box
+                px, py, pw, ph = self._face_last_bbox
+                cx_prev = px + pw * 0.5
+                cy_prev = py + ph * 0.5
+                cx_new = x + fw * 0.5
+                cy_new = y + fh * 0.5
+                dx = abs(cx_new - cx_prev)
+                dy = abs(cy_new - cy_prev)
+                area_ratio = (fw * fh) / max(1.0, float(pw * ph))
+                jump_ok = dx <= max(w * 0.12, pw * 1.0) and dy <= max(h * 0.10, ph * 1.0)
+                area_ok = 0.55 <= area_ratio <= 1.8
+                top_ok = int(h * 0.18) <= cy_new <= int(h * 0.75)
+                center_ok = (w * 0.12) <= cx_new <= (w * 0.88)
+                min_area_ok = (fw * fh) >= (w * h) * 0.0015
+                if jump_ok and area_ok and top_ok and center_ok and min_area_ok:
+                    self._face_last_bbox = (x, y, fw, fh)
+                    self._face_last_ts = monotonic()
+                    cx = x + fw * 0.5
+                    raw = (0.5 - (cx / max(w, 1))) * 1.6
+                    debug = {
+                        "kind": "face",
+                        "bbox": (int(x), int(y), int(fw), int(fh)),
+                        "centroid": (int(cx), int(y + fh * 0.5)),
+                        "detector": "tracker",
+                    }
+                    return max(-1.0, min(1.0, raw)), 0.21, debug
+                self._tracker = None
+
             # Try template tracking around last bbox before declaring miss.
             tracked = None
             if self._face_last_bbox is not None and self._face_template is not None:
                 x0, y0, w0, h0 = self._face_last_bbox
-                sx0 = max(0, x0 - int(w0 * 0.7))
-                sy0 = max(0, y0 - int(h0 * 0.7))
-                sx1 = min(w, x0 + w0 + int(w0 * 0.7))
-                sy1 = min(roi_h, y0 + h0 + int(h0 * 0.7))
+                sx0 = max(0, x0 - int(w0 * 0.9))
+                sy0 = max(0, y0 - int(h0 * 0.9))
+                sx1 = min(w, x0 + w0 + int(w0 * 0.9))
+                sy1 = min(roi_h, y0 + h0 + int(h0 * 0.9))
                 if sx1 - sx0 >= w0 and sy1 - sy0 >= h0:
                     search = roi[sy0:sy1, sx0:sx1]
                     tmpl = self._face_template
@@ -269,8 +345,8 @@ class VisionTracker:
                                 dx = abs(cx_new - cx_prev)
                                 dy = abs(cy_new - cy_prev)
                                 top_ok = ty >= int(h * 0.08)
-                                max_tmpl_jump_x = max(w * 0.08, w0 * 0.6)
-                                max_tmpl_jump_y = max(h * 0.07, h0 * 0.55)
+                                max_tmpl_jump_x = max(w * 0.10, w0 * 0.7)
+                                max_tmpl_jump_y = max(h * 0.08, h0 * 0.65)
                                 jump_ok = dx <= max_tmpl_jump_x and dy <= max_tmpl_jump_y
                                 if top_ok and jump_ok:
                                     tracked = (tx, ty, tw, th, float(max_val))
@@ -280,6 +356,7 @@ class VisionTracker:
                 x, y, fw, fh, score = tracked
                 self._face_last_bbox = (x, y, fw, fh)
                 self._face_last_ts = monotonic()
+                self._tracker_init(frame, (x, y, fw, fh))
                 cx = x + fw * 0.5
                 raw = (0.5 - (cx / max(w, 1))) * 1.6
                 debug = {
@@ -291,7 +368,7 @@ class VisionTracker:
                 }
                 return max(-1.0, min(1.0, raw)), 0.22, debug
             # Short hold to reduce flicker on brief misses.
-            if self._face_last_bbox is not None and (monotonic() - self._face_last_ts) < 1.0:
+            if self._face_last_bbox is not None and (monotonic() - self._face_last_ts) < 1.2:
                 x, y, fw, fh = self._face_last_bbox
                 cx = x + fw * 0.5
                 raw = (0.5 - (cx / max(w, 1))) * 1.6
@@ -375,6 +452,7 @@ class VisionTracker:
         x, y, fw, fh, detector = chosen
         self._face_last_bbox = (x, y, fw, fh)
         self._face_last_ts = monotonic()
+        self._tracker_init(frame, (x, y, fw, fh))
         if detector == "frontal":
             try:
                 patch = roi[y : y + fh, x : x + fw]
@@ -465,9 +543,10 @@ class VisionTracker:
                 raw, conf, debug = hog
                 self._last_debug = debug
                 return PoseSample(steer_raw=raw, confidence=conf, source="camera-hog", ts=monotonic())
-            raw, conf, debug = self._blob_lean(frame)
-            self._last_debug = debug
-            return PoseSample(steer_raw=raw, confidence=conf, source="camera-blob", ts=monotonic())
+            # In face/HOG fallback mode, motion-blob steering is too noisy and can cause random jumps.
+            # Fail safe to neutral until a face/hog detection is reacquired.
+            self._last_debug = {"kind": "face", "miss": True, "fallback": "neutral"}
+            return PoseSample(steer_raw=0.0, confidence=0.0, source="camera-face", ts=monotonic())
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         res = self._pose.process(rgb)
@@ -514,3 +593,4 @@ class VisionTracker:
         self._face_last_bbox = None
         self._face_last_ts = 0.0
         self._face_template = None
+        self._tracker = None
