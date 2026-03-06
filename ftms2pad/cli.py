@@ -19,6 +19,98 @@ def _calibration_path(profile: str) -> Path:
     return Path("profiles") / f"{profile}.calibration.json"
 
 
+def _parse_camera_arg(camera_arg: str) -> list[str]:
+    parts = [p.strip() for p in str(camera_arg).split(",") if p.strip()]
+    return parts or ["auto"]
+
+
+class VisionMux:
+    def __init__(self, steering_mode: str, camera_arg: str) -> None:
+        cameras = _parse_camera_arg(camera_arg)
+        self._trackers = [VisionTracker(steering_mode, camera=c) for c in cameras]
+        self.camera_idx = ",".join(str(t.camera_idx) for t in self._trackers)
+        self._active = 0
+        self._pending = None
+        self._pending_count = 0
+
+    def _score(self, p, debug: dict[str, object], idx: int) -> float:
+        score = float(getattr(p, "confidence", 0.0))
+        detector = str(debug.get("detector", ""))
+        held = bool(debug.get("held", False))
+        centroid = debug.get("centroid")
+        if centroid is None:
+            score -= 0.35
+        if detector in ("frontal", "profile_l", "profile_r"):
+            score += 0.07
+        elif detector in ("template", "tracker"):
+            score += 0.03
+        if held:
+            score -= 0.05
+        if idx == self._active:
+            score += 0.03
+        return score
+
+    def _select_index(self, scored: list[tuple[float, int]]) -> int:
+        if len(scored) == 1:
+            return scored[0][1]
+        scored.sort(reverse=True)
+        best_score, best_idx = scored[0]
+        active_score = next((s for s, i in scored if i == self._active), -1.0)
+        if best_idx == self._active:
+            self._pending = None
+            self._pending_count = 0
+            return self._active
+        # Hysteresis: require clear improvement for a few consecutive frames.
+        if best_score < active_score + 0.07:
+            self._pending = None
+            self._pending_count = 0
+            return self._active
+        if self._pending == best_idx:
+            self._pending_count += 1
+        else:
+            self._pending = best_idx
+            self._pending_count = 1
+        if self._pending_count >= 3:
+            self._active = best_idx
+            self._pending = None
+            self._pending_count = 0
+        return self._active
+
+    def next_with_frame(self):
+        samples: list[tuple[object, object, dict[str, object], int]] = []
+        scored: list[tuple[float, int]] = []
+        for i, tracker in enumerate(self._trackers):
+            p, frame, debug = tracker.next_with_frame()
+            samples.append((p, frame, debug, i))
+            scored.append((self._score(p, debug, i), i))
+        chosen = self._select_index(scored)
+        p, frame, debug, i = samples[chosen]
+        debug = dict(debug)
+        debug["camera_idx"] = self._trackers[i].camera_idx
+        debug["mux"] = {"active": i, "count": len(self._trackers)}
+        return p, frame, debug
+
+    def next(self):
+        samples: list[tuple[object, dict[str, object], int]] = []
+        scored: list[tuple[float, int]] = []
+        for i, tracker in enumerate(self._trackers):
+            p, frame, debug = tracker.next_with_frame()
+            del frame
+            samples.append((p, debug, i))
+            scored.append((self._score(p, debug, i), i))
+        chosen = self._select_index(scored)
+        p, _debug, _i = samples[chosen]
+        return p
+
+    def reset_tracking(self) -> None:
+        for t in self._trackers:
+            t.reset_tracking()
+
+    def close(self) -> None:
+        for t in self._trackers:
+            t.close()
+
+
 class DebugLogger:
     def __init__(
         self,
@@ -430,7 +522,7 @@ def cmd_list_cameras(_: argparse.Namespace) -> int:
 
 async def cmd_calibrate(args: argparse.Namespace) -> int:
     profile = load_profile(args.profile)
-    vision = VisionTracker(profile.steering.mode, camera=args.camera)
+    vision = VisionMux(profile.steering.mode, camera_arg=args.camera)
     dbg = DebugLogger(args.debug_log, "calibrate", args.debug_fps, args.debug_width, args.debug_height)
     if dbg.enabled and dbg.session_dir is not None:
         print(f"debug log: {dbg.session_dir}")
@@ -626,7 +718,7 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
     calib = load_calibration(_calibration_path(args.profile))
     fusion = FusionPipeline(profile, calibrator=calib)
     ftms = FtmsSource(args.bike)
-    vision = VisionTracker(profile.steering.mode, camera=args.camera)
+    vision = VisionMux(profile.steering.mode, camera_arg=args.camera)
     pad = None
     if not monitor_only:
         pad = VirtualGamepad(
@@ -779,7 +871,7 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--profile", default="supertuxkart")
     common.add_argument("--bike", default="sim", help="BLE addr/name, or sim")
-    common.add_argument("--camera", default="auto", help="camera index or auto")
+    common.add_argument("--camera", default="auto", help="camera index, auto, or comma list (e.g. 0,2)")
     common.add_argument("--hz", type=int, default=60, help="main loop frequency")
     common.add_argument("--debug-log", default="", help="directory to write debug bundle")
     common.add_argument("--debug-fps", type=float, default=10.0, help="debug video FPS")
