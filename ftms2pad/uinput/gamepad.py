@@ -36,11 +36,24 @@ class VirtualGamepad:
         # evdev expects AbsInfo(value, min, max, fuzz, flat, resolution).
         # Using a 4-tuple here can be misinterpreted and cause EINVAL from uinput.
         absinfo = AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)
+        pair = {
+            "ABS_X": "ABS_Y",
+            "ABS_Y": "ABS_X",
+            "ABS_RX": "ABS_RY",
+            "ABS_RY": "ABS_RX",
+            "ABS_Z": "ABS_RZ",
+            "ABS_RZ": "ABS_Z",
+        }
+        axis_names = {self.steer_axis, self.throttle_axis}
+        # Expose stick pairs so SDL/games map axes consistently.
+        for name in list(axis_names):
+            other = pair.get(name)
+            if other is not None:
+                axis_names.add(other)
+        abs_caps = [(getattr(e, name), absinfo) for name in sorted(axis_names)]
+
         capabilities = {
-            e.EV_ABS: [
-                (getattr(e, self.steer_axis), absinfo),
-                (getattr(e, self.throttle_axis), absinfo),
-            ],
+            e.EV_ABS: abs_caps,
             e.EV_KEY: [e.BTN_A, e.BTN_B, e.BTN_X, e.BTN_Y],
         }
 

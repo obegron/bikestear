@@ -77,14 +77,16 @@ def _create_pose() -> Any:
 
 
 class VisionTracker:
-    def __init__(self, steering_mode: str, camera: str = "auto") -> None:
+    def __init__(self, steering_mode: str, camera: str = "auto", width: int = 640, height: int = 360) -> None:
         self.steering_mode = steering_mode
         self.camera_idx = self._pick_camera(camera)
         self._camera_label = camera_name(self.camera_idx).lower()
         self._is_ir_camera = "ir" in self._camera_label
+        self._vision_width = max(160, int(width))
+        self._vision_height = max(120, int(height))
         self.cap = cv2.VideoCapture(self.camera_idx)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._vision_width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._vision_height)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
         self._t = 0.0
         self._pose = _create_pose()
@@ -221,14 +223,29 @@ class VisionTracker:
         gray = cv2.equalizeHist(gray)
         roi_h = max(1, int(h * 0.85))
         roi = gray[:roi_h, :]
+        search_x0 = 0
+        search_x1 = w
+        if self._face_last_bbox is not None and (monotonic() - self._face_last_ts) < 3.0:
+            lx, ly, lw, lh = self._face_last_bbox
+            lc = lx + lw * 0.5
+            half = max(int(w * 0.24), int(lw * 2.0))
+            search_x0 = max(0, int(lc) - half)
+            search_x1 = min(w, int(lc) + half)
+            min_span = int(w * 0.42)
+            if (search_x1 - search_x0) < min_span:
+                cx = (search_x0 + search_x1) // 2
+                search_x0 = max(0, cx - min_span // 2)
+                search_x1 = min(w, cx + min_span // 2)
+        roi_search = roi[:, search_x0:search_x1]
         frontal = self._face.detectMultiScale(
-            roi,
+            roi_search,
             scaleFactor=1.1,
             minNeighbors=7,
             minSize=(max(36, w // 20), max(36, h // 20)),
         )
         candidates: list[tuple[int, int, int, int, str]] = []
-        for (x, y, fw, fh) in frontal:
+        for (x_local, y, fw, fh) in frontal:
+            x = int(x_local) + search_x0
             cy = y + fh * 0.5
             cx = x + fw * 0.5
             if cy < h * 0.18:
@@ -246,12 +263,13 @@ class VisionTracker:
 
         if self._face_profile is not None and not self._face_profile.empty():
             prof_l = self._face_profile.detectMultiScale(
-                roi,
+                roi_search,
                 scaleFactor=1.1,
                 minNeighbors=4,
                 minSize=(max(30, w // 24), max(30, h // 24)),
             )
-            for (x, y, fw, fh) in prof_l:
+            for (x_local, y, fw, fh) in prof_l:
+                x = int(x_local) + search_x0
                 cy = y + fh * 0.5
                 cx = x + fw * 0.5
                 if cy < h * 0.18:
@@ -267,7 +285,7 @@ class VisionTracker:
                     continue
                 candidates.append((int(x), int(y), int(fw), int(fh), "profile_l"))
 
-            roi_flip = cv2.flip(roi, 1)
+            roi_flip = cv2.flip(roi_search, 1)
             prof_r_flip = self._face_profile.detectMultiScale(
                 roi_flip,
                 scaleFactor=1.1,
@@ -275,7 +293,8 @@ class VisionTracker:
                 minSize=(max(30, w // 24), max(30, h // 24)),
             )
             for (xf, y, fw, fh) in prof_r_flip:
-                x = w - (int(xf) + int(fw))
+                roi_w = max(1, search_x1 - search_x0)
+                x = search_x0 + (roi_w - (int(xf) + int(fw)))
                 cy = y + fh * 0.5
                 cx = x + fw * 0.5
                 if cy < h * 0.18:

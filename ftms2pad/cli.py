@@ -25,9 +25,9 @@ def _parse_camera_arg(camera_arg: str) -> list[str]:
 
 
 class VisionMux:
-    def __init__(self, steering_mode: str, camera_arg: str) -> None:
+    def __init__(self, steering_mode: str, camera_arg: str, width: int = 640, height: int = 360) -> None:
         cameras = _parse_camera_arg(camera_arg)
-        self._trackers = [VisionTracker(steering_mode, camera=c) for c in cameras]
+        self._trackers = [VisionTracker(steering_mode, camera=c, width=width, height=height) for c in cameras]
         self.camera_idx = ",".join(str(t.camera_idx) for t in self._trackers)
         self._active = 0
         self._pending = None
@@ -522,7 +522,12 @@ def cmd_list_cameras(_: argparse.Namespace) -> int:
 
 async def cmd_calibrate(args: argparse.Namespace) -> int:
     profile = load_profile(args.profile)
-    vision = VisionMux(profile.steering.mode, camera_arg=args.camera)
+    vision = VisionMux(
+        profile.steering.mode,
+        camera_arg=args.camera,
+        width=args.vision_width,
+        height=args.vision_height,
+    )
     dbg = DebugLogger(args.debug_log, "calibrate", args.debug_fps, args.debug_width, args.debug_height)
     if dbg.enabled and dbg.session_dir is not None:
         print(f"debug log: {dbg.session_dir}")
@@ -718,7 +723,12 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
     calib = load_calibration(_calibration_path(args.profile))
     fusion = FusionPipeline(profile, calibrator=calib)
     ftms = FtmsSource(args.bike)
-    vision = VisionMux(profile.steering.mode, camera_arg=args.camera)
+    vision = VisionMux(
+        profile.steering.mode,
+        camera_arg=args.camera,
+        width=args.vision_width,
+        height=args.vision_height,
+    )
     pad = None
     if not monitor_only:
         pad = VirtualGamepad(
@@ -884,6 +894,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--debug-fps", type=float, default=10.0, help="debug video FPS")
     common.add_argument("--debug-width", type=int, default=640, help="debug video width")
     common.add_argument("--debug-height", type=int, default=360, help="debug video height")
+    common.add_argument("--vision-width", type=int, default=640, help="camera capture width")
+    common.add_argument("--vision-height", type=int, default=360, help="camera capture height")
 
     c = sub.add_parser("run", parents=[common], help="Emit virtual gamepad")
     c.set_defaults(fn=cmd_run)
