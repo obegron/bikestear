@@ -80,6 +80,8 @@ class VisionTracker:
     def __init__(self, steering_mode: str, camera: str = "auto") -> None:
         self.steering_mode = steering_mode
         self.camera_idx = self._pick_camera(camera)
+        self._camera_label = camera_name(self.camera_idx).lower()
+        self._is_ir_camera = "ir" in self._camera_label
         self.cap = cv2.VideoCapture(self.camera_idx)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
@@ -94,6 +96,8 @@ class VisionTracker:
         self._face_profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
         self._face_last_bbox: tuple[int, int, int, int] | None = None
         self._face_last_ts: float = 0.0
+        self._face_last_hard_bbox: tuple[int, int, int, int] | None = None
+        self._face_last_hard_ts: float = 0.0
         self._face_template = None
         self._tracker = None
         self._last_debug: dict[str, object] = {}
@@ -288,6 +292,41 @@ class VisionTracker:
                 candidates.append((int(x), int(y), int(fw), int(fh), "profile_r"))
 
         if not candidates:
+            # Relaxed local re-detection around last known box helps re-acquire during turns.
+            if self._face_last_bbox is not None and (monotonic() - self._face_last_ts) < 2.5:
+                x0, y0, w0, h0 = self._face_last_bbox
+                rx0 = max(0, x0 - int(w0 * 1.8))
+                ry0 = max(0, y0 - int(h0 * 1.6))
+                rx1 = min(w, x0 + w0 + int(w0 * 1.8))
+                ry1 = min(roi_h, y0 + h0 + int(h0 * 1.6))
+                if rx1 - rx0 >= max(24, w0 // 2) and ry1 - ry0 >= max(24, h0 // 2):
+                    local = roi[ry0:ry1, rx0:rx1]
+                    try:
+                        rel = self._face.detectMultiScale(
+                            local,
+                            scaleFactor=1.05,
+                            minNeighbors=4,
+                            minSize=(max(28, w // 26), max(28, h // 26)),
+                        )
+                    except Exception:
+                        rel = []
+                    for (lx, ly, fw, fh) in rel:
+                        x = rx0 + int(lx)
+                        y = ry0 + int(ly)
+                        cy = y + fh * 0.5
+                        cx = x + fw * 0.5
+                        if cy < h * 0.16 or cy > h * 0.78:
+                            continue
+                        if fw * fh < (w * h) * 0.0014:
+                            continue
+                        if not (w * 0.08 <= cx <= w * 0.92):
+                            continue
+                        ar = fw / max(1.0, float(fh))
+                        if not (0.55 <= ar <= 1.7):
+                            continue
+                        candidates.append((int(x), int(y), int(fw), int(fh), "frontal_relaxed"))
+
+        if not candidates:
             # First try persistent tracker to bridge short face-detector misses while turning.
             tracked_box = self._tracker_update_bbox(frame)
             if tracked_box is not None and self._face_last_bbox is not None:
@@ -305,7 +344,18 @@ class VisionTracker:
                 top_ok = int(h * 0.18) <= cy_new <= int(h * 0.75)
                 center_ok = (w * 0.12) <= cx_new <= (w * 0.88)
                 min_area_ok = (fw * fh) >= (w * h) * 0.0015
-                if jump_ok and area_ok and top_ok and center_ok and min_area_ok:
+                hard_ok = False
+                hard_window_s = 1.2 if self._is_ir_camera else 2.0
+                if self._face_last_hard_bbox is not None and (monotonic() - self._face_last_hard_ts) < hard_window_s:
+                    hx, hy, hw, hh = self._face_last_hard_bbox
+                    hcx = hx + hw * 0.5
+                    hcy = hy + hh * 0.5
+                    hard_dx = abs(cx_new - hcx)
+                    hard_dy = abs(cy_new - hcy)
+                    hard_dx_lim = max(w * (0.20 if self._is_ir_camera else 0.28), hw * (1.8 if self._is_ir_camera else 2.3))
+                    hard_dy_lim = max(h * (0.16 if self._is_ir_camera else 0.22), hh * (1.8 if self._is_ir_camera else 2.3))
+                    hard_ok = hard_dx <= hard_dx_lim and hard_dy <= hard_dy_lim
+                if jump_ok and area_ok and top_ok and center_ok and min_area_ok and hard_ok:
                     self._face_last_bbox = (x, y, fw, fh)
                     self._face_last_ts = monotonic()
                     cx = x + fw * 0.5
@@ -356,7 +406,6 @@ class VisionTracker:
                 x, y, fw, fh, score = tracked
                 self._face_last_bbox = (x, y, fw, fh)
                 self._face_last_ts = monotonic()
-                self._tracker_init(frame, (x, y, fw, fh))
                 cx = x + fw * 0.5
                 raw = (0.5 - (cx / max(w, 1))) * 1.6
                 debug = {
@@ -452,7 +501,10 @@ class VisionTracker:
         x, y, fw, fh, detector = chosen
         self._face_last_bbox = (x, y, fw, fh)
         self._face_last_ts = monotonic()
-        self._tracker_init(frame, (x, y, fw, fh))
+        if detector in ("frontal", "frontal_relaxed", "profile_l", "profile_r"):
+            self._face_last_hard_bbox = (x, y, fw, fh)
+            self._face_last_hard_ts = self._face_last_ts
+            self._tracker_init(frame, (x, y, fw, fh))
         if detector == "frontal":
             try:
                 patch = roi[y : y + fh, x : x + fw]
@@ -592,5 +644,7 @@ class VisionTracker:
     def reset_tracking(self) -> None:
         self._face_last_bbox = None
         self._face_last_ts = 0.0
+        self._face_last_hard_bbox = None
+        self._face_last_hard_ts = 0.0
         self._face_template = None
         self._tracker = None

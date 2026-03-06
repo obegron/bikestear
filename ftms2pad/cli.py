@@ -196,6 +196,9 @@ def _anchor_gate_pass(
     dx = abs(cent[0] - ax)
     dy = abs(cent[1] - ay)
     if source == "camera-face":
+        detector = str(debug.get("detector", ""))
+        if detector == "tracker":
+            return dx <= int(w * 0.22) and dy <= int(h * 0.22)
         return dx <= int(w * 0.28) and dy <= int(h * 0.30)
     if source in ("camera-hog", "camera-blob"):
         return dx <= int(w * 0.45)
