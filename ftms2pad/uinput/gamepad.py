@@ -4,8 +4,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 try:
-    from evdev import UInput, ecodes as e
+    from evdev import AbsInfo, UInput, ecodes as e
 except Exception:  # pragma: no cover
+    AbsInfo = None
     UInput = None
     e = None
 
@@ -22,14 +23,19 @@ class VirtualGamepad:
     invert_throttle: bool = True
     enabled: bool = field(init=False, default=False)
     ui: Any = field(init=False, default=None)
+    error: str = field(init=False, default="")
 
     def __post_init__(self) -> None:
         self.enabled = UInput is not None and e is not None
         self.ui = None
+        self.error = ""
         if not self.enabled:
+            self.error = "evdev UInput not available"
             return
 
-        absinfo = (-32768, 32767, 0, 0)
+        # evdev expects AbsInfo(value, min, max, fuzz, flat, resolution).
+        # Using a 4-tuple here can be misinterpreted and cause EINVAL from uinput.
+        absinfo = AbsInfo(value=0, min=-32768, max=32767, fuzz=0, flat=0, resolution=0)
         capabilities = {
             e.EV_ABS: [
                 (getattr(e, self.steer_axis), absinfo),
@@ -40,8 +46,9 @@ class VirtualGamepad:
 
         try:
             self.ui = UInput(events=capabilities, name="ftms2pad", version=0x3)
-        except Exception:
+        except Exception as exc:
             self.enabled = False
+            self.error = f"{type(exc).__name__}: {exc}"
 
     def emit(self, steer: float, throttle: float) -> None:
         if self.invert_throttle:

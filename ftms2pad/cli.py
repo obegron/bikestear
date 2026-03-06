@@ -734,10 +734,17 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
         if dbg.enabled and dbg.session_dir is not None:
             print(f"debug log: {dbg.session_dir}")
         if not monitor_only and (pad is None or not pad.enabled):
-            print("uinput unavailable. Running monitor-only output.")
+            reason = ""
+            if pad is not None:
+                reason = getattr(pad, "error", "") or ""
+            if reason:
+                print(f"uinput unavailable ({reason}). Running monitor-only output.")
+            else:
+                print("uinput unavailable. Running monitor-only output.")
 
         hz = max(20, min(120, args.hz))
         dt = 1.0 / hz
+        mirror_preview = not getattr(args, "no_mirror", False)
         gui_enabled = monitor_only and not getattr(args, "no_gui", False)
         cv2 = None
         win = None
@@ -768,7 +775,7 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
                 anchor,
                 frame.shape[1] if frame is not None else None,
                 frame.shape[0] if frame is not None else None,
-                mirrored=not args.no_mirror,
+                mirrored=mirror_preview,
             )
             pose_ok = p.confidence >= _pose_conf_threshold(p.source) and pass_anchor
             steer = fusion.steer(p.steer_raw, pose_ok=pose_ok)
@@ -786,7 +793,7 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
 
             if gui_enabled and cv2 is not None and frame is not None and win is not None:
                 h, w = frame.shape[:2]
-                cent = _debug_centroid_px(debug, w, h, mirrored=not args.no_mirror)
+                cent = _debug_centroid_px(debug, w, h, mirrored=mirror_preview)
                 if cent is not None and not anchor_locked:
                     if anchor is None:
                         anchor = cent
@@ -798,7 +805,7 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
                     f,
                     steer,
                     throttle,
-                    mirror_preview=not args.no_mirror,
+                    mirror_preview=mirror_preview,
                     debug=debug,
                     anchor=anchor,
                 )
@@ -832,7 +839,7 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
                     extra={"pose_ok": pose_ok, "pass_anchor": pass_anchor},
                 )
             await asyncio.sleep(dt)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nStopped.")
         return 0
     finally:
@@ -900,9 +907,13 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     fn = args.fn
-    if inspect.iscoroutinefunction(fn):
-        raise SystemExit(asyncio.run(fn(args)))
-    raise SystemExit(fn(args))
+    try:
+        if inspect.iscoroutinefunction(fn):
+            raise SystemExit(asyncio.run(fn(args)))
+        raise SystemExit(fn(args))
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":
