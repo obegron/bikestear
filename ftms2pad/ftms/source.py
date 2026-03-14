@@ -15,6 +15,9 @@ except Exception:  # pragma: no cover
 
 FTMS_SERVICE_UUID = "00001826-0000-1000-8000-00805f9b34fb"
 INDOOR_BIKE_DATA_CHAR_UUID = "00002ad2-0000-1000-8000-00805f9b34fb"
+FITNESS_MACHINE_CONTROL_POINT_CHAR_UUID = "00002ad9-0000-1000-8000-00805f9b34fb"
+_FTMS_REQUEST_CONTROL = b"\x00"
+_FTMS_START_OR_RESUME = b"\x07"
 _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
 
@@ -63,18 +66,31 @@ def parse_indoor_bike_data(payload: bytes) -> tuple[float, float, float]:
 async def list_ble_devices(timeout: float = 4.0) -> list[tuple[str, str, bool]]:
     if BleakScanner is None:
         return []
-    devices = await BleakScanner.discover(timeout=timeout)
     rows: list[tuple[str, str, bool]] = []
-    for d in devices:
-        uuids = (d.metadata or {}).get("uuids") or []
+    try:
+        discovered = await BleakScanner.discover(timeout=timeout, return_adv=True)
+    except TypeError:
+        discovered = await BleakScanner.discover(timeout=timeout)
+
+    if isinstance(discovered, dict):
+        for d, adv in discovered.values():
+            uuids = getattr(adv, "service_uuids", None) or []
+            ftms = any(str(u).lower() == FTMS_SERVICE_UUID for u in uuids)
+            rows.append((d.name or getattr(adv, "local_name", None) or "(unnamed)", d.address, ftms))
+        return sorted(rows, key=lambda r: (not r[2], r[0].lower(), r[1]))
+
+    for d in discovered:
+        metadata = getattr(d, "metadata", None) or {}
+        uuids = metadata.get("uuids") or []
         ftms = any(str(u).lower() == FTMS_SERVICE_UUID for u in uuids)
         rows.append((d.name or "(unnamed)", d.address, ftms))
     return sorted(rows, key=lambda r: (not r[2], r[0].lower(), r[1]))
 
 
 class FtmsSource:
-    def __init__(self, bike: str = "sim") -> None:
+    def __init__(self, bike: str = "sim", verbose: bool = False) -> None:
         self.bike = bike
+        self.verbose = verbose
         self._t = 0.0
         self._latest = FtmsSample.disconnected()
         self._client = None
@@ -82,6 +98,10 @@ class FtmsSource:
         self._last_attempt = 0.0
         self._backoff_s = 1.0
         self._connected_evt = asyncio.Event()
+
+    def _log(self, message: str) -> None:
+        if self.verbose:
+            print(f"[ftms] {message}")
 
     async def next(self) -> FtmsSample:
         if self.bike == "sim":
@@ -118,13 +138,25 @@ class FtmsSource:
     async def _connect_once(self) -> None:
         device = await self._resolve_device()
         if device is None:
-            self._backoff_s = min(20.0, max(1.0, self._backoff_s * 1.5))
-            return
+            if _MAC_RE.match(self.bike):
+                # On BlueZ, a known BLE peripheral can sometimes be connected by
+                # address even when a short scan did not return it.
+                self._log(f"scan miss for {self.bike}; attempting direct connect")
+                device = self.bike
+            else:
+                self._log(f"device not found: {self.bike}")
+                self._backoff_s = min(20.0, max(1.0, self._backoff_s * 1.5))
+                return
+        self._log(f"connecting to {self.bike}")
         client = BleakClient(device, disconnected_callback=self._on_disconnected)
         try:
             await client.connect()
+            self._log("connected")
+            await self._initialize_ftms_session(client)
             await client.start_notify(INDOOR_BIKE_DATA_CHAR_UUID, self._on_indoor_bike_data)
+            self._log("subscribed to indoor bike data")
         except Exception:
+            self._log("connect/setup failed")
             try:
                 await client.disconnect()
             except Exception:
@@ -136,6 +168,26 @@ class FtmsSource:
         self._client = client
         self._backoff_s = 1.0
         self._connected_evt.set()
+
+    async def _initialize_ftms_session(self, client) -> None:
+        # Some trainers expose FTMS data only after a control-point handshake.
+        try:
+            await client.start_notify(FITNESS_MACHINE_CONTROL_POINT_CHAR_UUID, self._on_control_point)
+            self._log("subscribed to control point")
+        except Exception:
+            self._log("control point notify unavailable")
+            pass
+
+        for command, label in (
+            (_FTMS_REQUEST_CONTROL, "request_control"),
+            (_FTMS_START_OR_RESUME, "start_or_resume"),
+        ):
+            try:
+                await client.write_gatt_char(FITNESS_MACHINE_CONTROL_POINT_CHAR_UUID, command, response=True)
+                self._log(f"sent {label}")
+            except Exception:
+                self._log(f"control point write failed: {label}")
+                return
 
     async def _resolve_device(self):
         if _MAC_RE.match(self.bike):
@@ -171,13 +223,21 @@ class FtmsSource:
         self._connected_evt.clear()
         self._latest = FtmsSample.disconnected()
 
+    def _on_control_point(self, _sender, payload: bytearray) -> None:
+        self._log(f"control point indication: {bytes(payload).hex()}")
+
     async def close(self) -> None:
         if self._client is None:
             return
         try:
             if getattr(self._client, "is_connected", False):
+                try:
+                    await self._client.stop_notify(FITNESS_MACHINE_CONTROL_POINT_CHAR_UUID)
+                except Exception:
+                    pass
                 await self._client.stop_notify(INDOOR_BIKE_DATA_CHAR_UUID)
                 await self._client.disconnect()
+                self._log("disconnected")
         except Exception:
             pass
         finally:

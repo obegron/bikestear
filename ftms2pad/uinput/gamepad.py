@@ -24,11 +24,13 @@ class VirtualGamepad:
     enabled: bool = field(init=False, default=False)
     ui: Any = field(init=False, default=None)
     error: str = field(init=False, default="")
+    _pressed_buttons: set[int] = field(init=False, default_factory=set)
 
     def __post_init__(self) -> None:
         self.enabled = UInput is not None and e is not None
         self.ui = None
         self.error = ""
+        self._pressed_buttons = set()
         if not self.enabled:
             self.error = "evdev UInput not available"
             return
@@ -52,9 +54,23 @@ class VirtualGamepad:
                 axis_names.add(other)
         abs_caps = [(getattr(e, name), absinfo) for name in sorted(axis_names)]
 
+        button_names = [
+            "BTN_A",
+            "BTN_B",
+            "BTN_X",
+            "BTN_Y",
+            "BTN_TL",
+            "BTN_TR",
+            "BTN_SELECT",
+            "BTN_START",
+            "BTN_THUMBL",
+            "BTN_THUMBR",
+        ]
+        key_caps = [getattr(e, name) for name in button_names if hasattr(e, name)]
+
         capabilities = {
             e.EV_ABS: abs_caps,
-            e.EV_KEY: [e.BTN_A, e.BTN_B, e.BTN_X, e.BTN_Y],
+            e.EV_KEY: key_caps,
         }
 
         try:
@@ -73,6 +89,38 @@ class VirtualGamepad:
         self.ui.write(e.EV_ABS, getattr(e, self.throttle_axis), _to_axis(throttle))
         self.ui.syn()
 
+    def emit_button(self, button_name: str, pressed: bool) -> None:
+        if not self.enabled or self.ui is None or e is None:
+            return
+        code = getattr(e, button_name, None)
+        if code is None:
+            return
+        if pressed:
+            if code in self._pressed_buttons:
+                return
+            self._pressed_buttons.add(code)
+            self.ui.write(e.EV_KEY, code, 1)
+            self.ui.syn()
+            return
+        if code not in self._pressed_buttons:
+            return
+        self._pressed_buttons.remove(code)
+        self.ui.write(e.EV_KEY, code, 0)
+        self.ui.syn()
+
+    def tap_button(self, button_name: str) -> None:
+        self.emit_button(button_name, True)
+        self.emit_button(button_name, False)
+
     def close(self) -> None:
         if self.ui is not None:
+            for code in list(self._pressed_buttons):
+                try:
+                    self.ui.write(e.EV_KEY, code, 0)
+                except Exception:
+                    pass
+            try:
+                self.ui.syn()
+            except Exception:
+                pass
             self.ui.close()

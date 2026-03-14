@@ -25,13 +25,22 @@ def _parse_camera_arg(camera_arg: str) -> list[str]:
 
 
 class VisionMux:
-    def __init__(self, steering_mode: str, camera_arg: str, width: int = 640, height: int = 360) -> None:
+    def __init__(
+        self,
+        steering_mode: str,
+        camera_arg: str,
+        width: int = 640,
+        height: int = 360,
+        idle_hz: float = 8.0,
+    ) -> None:
         cameras = _parse_camera_arg(camera_arg)
         self._trackers = [VisionTracker(steering_mode, camera=c, width=width, height=height) for c in cameras]
         self.camera_idx = ",".join(str(t.camera_idx) for t in self._trackers)
         self._active = 0
-        self._pending = None
+        self._pending: int | None = None
         self._pending_count = 0
+        self._idle_interval = 1.0 / max(1.0, float(idle_hz))
+        self._cache: list[tuple[object, object | None, dict[str, object], float] | None] = [None] * len(self._trackers)
 
     def _score(self, p, debug: dict[str, object], idx: int) -> float:
         score = float(getattr(p, "confidence", 0.0))
@@ -76,30 +85,69 @@ class VisionMux:
             self._pending_count = 0
         return self._active
 
-    def next_with_frame(self):
-        samples: list[tuple[object, object, dict[str, object], int]] = []
-        scored: list[tuple[float, int]] = []
-        for i, tracker in enumerate(self._trackers):
-            p, frame, debug = tracker.next_with_frame()
-            samples.append((p, frame, debug, i))
-            scored.append((self._score(p, debug, i), i))
-        chosen = self._select_index(scored)
-        p, frame, debug, i = samples[chosen]
+    def _sample_tracker(self, idx: int) -> tuple[object, object | None, dict[str, object]]:
+        p, frame, debug = self._trackers[idx].next_with_frame()
         debug = dict(debug)
-        debug["camera_idx"] = self._trackers[i].camera_idx
-        debug["mux"] = {"active": i, "count": len(self._trackers)}
+        debug["camera_idx"] = self._trackers[idx].camera_idx
+        debug["mux"] = {"active": idx, "count": len(self._trackers)}
+        self._cache[idx] = (p, frame, debug, monotonic())
+        return p, frame, debug
+
+    def _ensure_fresh_samples(self) -> None:
+        now = monotonic()
+        self._sample_tracker(self._active)
+
+        for i in range(len(self._trackers)):
+            if i == self._active:
+                continue
+            cached = self._cache[i]
+            if cached is None:
+                self._sample_tracker(i)
+                continue
+            _, _frame, _debug, ts = cached
+            if (now - ts) >= self._idle_interval:
+                self._sample_tracker(i)
+
+    def _scored_indexes(self) -> list[tuple[float, int]]:
+        now = monotonic()
+        scored: list[tuple[float, int]] = []
+        for i, cached in enumerate(self._cache):
+            if cached is None:
+                continue
+            p, _frame, debug, ts = cached
+            age = max(0.0, now - ts)
+            score = self._score(p, debug, i) - min(0.35, age * 0.45)
+            scored.append((score, i))
+        return scored
+
+    def next_with_frame(self):
+        self._ensure_fresh_samples()
+        scored = self._scored_indexes()
+        if not scored:
+            p, frame, debug = self._sample_tracker(self._active)
+            return p, frame, debug
+        chosen = self._select_index(scored)
+        cached = self._cache[chosen]
+        if cached is None:
+            p, frame, debug = self._sample_tracker(chosen)
+            return p, frame, debug
+        p, frame, debug, _ts = cached
+        debug = dict(debug)
+        debug["mux"] = {"active": chosen, "count": len(self._trackers)}
         return p, frame, debug
 
     def next(self):
-        samples: list[tuple[object, dict[str, object], int]] = []
-        scored: list[tuple[float, int]] = []
-        for i, tracker in enumerate(self._trackers):
-            p, frame, debug = tracker.next_with_frame()
-            del frame
-            samples.append((p, debug, i))
-            scored.append((self._score(p, debug, i), i))
+        self._ensure_fresh_samples()
+        scored = self._scored_indexes()
+        if not scored:
+            p, _frame, _debug = self._sample_tracker(self._active)
+            return p
         chosen = self._select_index(scored)
-        p, _debug, _i = samples[chosen]
+        cached = self._cache[chosen]
+        if cached is None:
+            p, _frame, _debug = self._sample_tracker(chosen)
+            return p
+        p, _frame, _debug, _ts = cached
         return p
 
     def reset_tracking(self) -> None:
@@ -269,6 +317,10 @@ def _debug_centroid_px(debug: dict, w: int, h: int, mirrored: bool) -> tuple[int
                 x = w - x
             return x, y
     return None
+
+
+def _debug_camera_key(debug: dict) -> str:
+    return str(debug.get("camera_idx", "default"))
 
 
 def _anchor_gate_pass(
@@ -527,6 +579,7 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
         camera_arg=args.camera,
         width=args.vision_width,
         height=args.vision_height,
+        idle_hz=args.mux_idle_hz,
     )
     dbg = DebugLogger(args.debug_log, "calibrate", args.debug_fps, args.debug_width, args.debug_height)
     if dbg.enabled and dbg.session_dir is not None:
@@ -551,8 +604,8 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
         buckets: dict[str, list[float]] = {"neutral": [], "left": [], "right": []}
         prep_seconds = max(0.5, float(args.prep_seconds))
         phase_seconds = max(1.0, float(args.phase_seconds))
-        anchor: tuple[int, int] | None = None
-        anchor_locked = False
+        anchors: dict[str, tuple[int, int]] = {}
+        anchor_locked: set[str] = set()
 
         if use_gui and cv2 is not None:
             try:
@@ -567,10 +620,12 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             await asyncio.sleep(1 / 30)
                             continue
                         h, w = frame.shape[:2]
+                        cam_key = _debug_camera_key(debug)
+                        anchor = anchors.get(cam_key)
                         cent = _debug_centroid_px(debug, w, h, mirrored=not args.no_mirror)
-                        if cent is not None and key == "neutral" and not anchor_locked:
-                            if anchor is None:
-                                anchor = cent
+                        if cent is not None and key == "neutral" and cam_key not in anchor_locked and anchor is None:
+                            anchors[cam_key] = cent
+                            anchor = cent
                         display = frame.copy()
                         _draw_calibration_frame(
                             cv2,
@@ -598,8 +653,8 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             cv2.destroyWindow(win)
                             return 1
                         if keycode == ord("r"):
-                            anchor = None
-                            anchor_locked = False
+                            anchors.clear()
+                            anchor_locked.clear()
                             vision.reset_tracking()
                         await asyncio.sleep(1 / 30)
 
@@ -609,6 +664,8 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                         if frame is None:
                             await asyncio.sleep(1 / 30)
                             continue
+                        cam_key = _debug_camera_key(debug)
+                        anchor = anchors.get(cam_key)
                         conf_th = _pose_conf_threshold(p.source)
                         pass_anchor = _anchor_gate_pass(
                             p.source, debug, anchor, frame.shape[1], frame.shape[0], mirrored=not args.no_mirror
@@ -617,10 +674,11 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             buckets[key].append(p.steer_raw)
                         h, w = frame.shape[:2]
                         cent = _debug_centroid_px(debug, w, h, mirrored=not args.no_mirror)
-                        if cent is not None and key == "neutral" and not anchor_locked:
+                        if cent is not None and key == "neutral" and cam_key not in anchor_locked:
                             if anchor is None:
+                                anchors[cam_key] = cent
                                 anchor = cent
-                            anchor_locked = True
+                            anchor_locked.add(cam_key)
 
                         display = frame.copy()
                         _draw_calibration_frame(
@@ -649,8 +707,8 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             cv2.destroyWindow(win)
                             return 1
                         if keycode == ord("r"):
-                            anchor = None
-                            anchor_locked = False
+                            anchors.clear()
+                            anchor_locked.clear()
                             vision.reset_tracking()
                         await asyncio.sleep(1 / 30)
                 cv2.destroyWindow(win)
@@ -722,12 +780,13 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
     profile = load_profile(args.profile)
     calib = load_calibration(_calibration_path(args.profile))
     fusion = FusionPipeline(profile, calibrator=calib)
-    ftms = FtmsSource(args.bike)
+    ftms = FtmsSource(args.bike, verbose=getattr(args, "verbose", False))
     vision = VisionMux(
         profile.steering.mode,
         camera_arg=args.camera,
         width=args.vision_width,
         height=args.vision_height,
+        idle_hz=args.mux_idle_hz,
     )
     pad = None
     if not monitor_only:
@@ -758,8 +817,7 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
         gui_enabled = monitor_only and not getattr(args, "no_gui", False)
         cv2 = None
         win = None
-        anchor: tuple[int, int] | None = None
-        anchor_locked = False
+        anchors: dict[str, tuple[int, int]] = {}
         if gui_enabled:
             try:
                 import cv2 as _cv2
@@ -770,15 +828,27 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
                 cv2.resizeWindow(win, 1100, 650)
             except Exception:
                 gui_enabled = False
+        last_stand_press = 0.0
+        button_releases: dict[str, float] = {}
+        stand_active = False
 
         while True:
             f = await ftms.next()
-            if gui_enabled:
-                p, frame, debug = vision.next_with_frame()
-            else:
-                p = vision.next()
-                frame = None
-                debug = {}
+            if pad is not None:
+                now = monotonic()
+                for button_name, release_at in list(button_releases.items()):
+                    if now >= release_at:
+                        pad.emit_button(button_name, False)
+                        del button_releases[button_name]
+            p, frame, debug = vision.next_with_frame()
+            cam_key = _debug_camera_key(debug)
+            anchor = anchors.get(cam_key)
+            if frame is not None:
+                h, w = frame.shape[:2]
+                cent = _debug_centroid_px(debug, w, h, mirrored=mirror_preview)
+                if cent is not None and anchor is None:
+                    anchors[cam_key] = cent
+                    anchor = cent
             pass_anchor = _anchor_gate_pass(
                 p.source,
                 debug,
@@ -790,6 +860,24 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
             pose_ok = p.confidence >= _pose_conf_threshold(p.source) and pass_anchor
             steer = fusion.steer(p.steer_raw, pose_ok=pose_ok)
             throttle = fusion.throttle(f.watts, connected=f.connected)
+
+            # Optional stand-to-button mapping (e.g. jump) based on head rise from anchor.
+            stand_button = str(getattr(args, "stand_button", "") or "").strip().upper()
+            if stand_button and frame is not None:
+                h, w = frame.shape[:2]
+                cent = _debug_centroid_px(debug, w, h, mirrored=mirror_preview)
+                if cent is not None and anchor is not None and pose_ok:
+                    stand_px = int(max(0.05, min(0.4, float(getattr(args, "stand_threshold", 0.14)))) * h)
+                    is_standing = cent[1] <= int(anchor[1]) - stand_px
+                    now = monotonic()
+                    cooldown = max(0.05, float(getattr(args, "stand_cooldown", 0.35)))
+                    if is_standing and not stand_active and (now - last_stand_press) >= cooldown and not monitor_only and pad is not None:
+                        pad.emit_button(stand_button, True)
+                        button_releases[stand_button] = now + 0.05
+                        last_stand_press = now
+                    stand_active = is_standing
+                else:
+                    stand_active = False
 
             if not monitor_only and pad is not None:
                 pad.emit(steer=steer, throttle=throttle)
@@ -804,10 +892,6 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
             if gui_enabled and cv2 is not None and frame is not None and win is not None:
                 h, w = frame.shape[:2]
                 cent = _debug_centroid_px(debug, w, h, mirrored=mirror_preview)
-                if cent is not None and not anchor_locked:
-                    if anchor is None:
-                        anchor = cent
-                        anchor_locked = True
                 _draw_monitor_frame(
                     cv2,
                     frame,
@@ -835,8 +919,8 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
                     print("\nStopped.")
                     return 0
                 if keycode == ord("r"):
-                    anchor = None
-                    anchor_locked = False
+                    anchors.clear()
+                    stand_active = False
                     vision.reset_tracking()
             else:
                 dbg.log(
@@ -888,6 +972,7 @@ def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--profile", default="supertuxkart")
     common.add_argument("--bike", default="sim", help="BLE addr/name, or sim")
+    common.add_argument("--verbose", action="store_true", help="Print FTMS BLE connection details")
     common.add_argument("--camera", default="auto", help="camera index, auto, or comma list (e.g. 0,2)")
     common.add_argument("--hz", type=int, default=60, help="main loop frequency")
     common.add_argument("--debug-log", default="", help="directory to write debug bundle")
@@ -896,6 +981,10 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--debug-height", type=int, default=360, help="debug video height")
     common.add_argument("--vision-width", type=int, default=640, help="camera capture width")
     common.add_argument("--vision-height", type=int, default=360, help="camera capture height")
+    common.add_argument("--mux-idle-hz", type=float, default=8.0, help="poll rate for inactive cameras in multi-camera mode")
+    common.add_argument("--stand-button", default="", help="button to tap when standing is detected (e.g. BTN_A)")
+    common.add_argument("--stand-threshold", type=float, default=0.14, help="fraction of frame height above anchor to count as stand")
+    common.add_argument("--stand-cooldown", type=float, default=0.35, help="seconds between stand-triggered taps")
 
     c = sub.add_parser("run", parents=[common], help="Emit virtual gamepad")
     c.set_defaults(fn=cmd_run)
