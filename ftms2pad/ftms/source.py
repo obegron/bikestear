@@ -97,6 +97,7 @@ class FtmsSource:
         self.verbose = verbose
         self._t = 0.0
         self._latest = FtmsSample.disconnected()
+        self._last_control_point_hex = ""
         self._client = None
         self._connecting = asyncio.Lock()
         self._last_attempt = 0.0
@@ -114,7 +115,16 @@ class FtmsSource:
             watts = max(0.0, 180.0 + 120.0 * sin(self._t * 0.6))
             cadence = max(0.0, 78.0 + 12.0 * sin(self._t * 0.45 + 0.2))
             speed = max(0.0, 28.0 + 8.0 * sin(self._t * 0.5 - 0.1))
-            return FtmsSample(watts=watts, cadence_rpm=cadence, speed_kph=speed, resistance_level=0.0, connected=True, ts=monotonic())
+            return FtmsSample(
+                watts=watts,
+                cadence_rpm=cadence,
+                speed_kph=speed,
+                resistance_level=0.0,
+                connected=True,
+                ts=monotonic(),
+                raw_hex="",
+                control_point_hex="",
+            )
 
         await self._ensure_connected()
         await asyncio.sleep(0.02)
@@ -213,7 +223,8 @@ class FtmsSource:
         return None
 
     def _on_indoor_bike_data(self, _sender, payload: bytearray) -> None:
-        watts, cadence_rpm, speed_kph, resistance_level = parse_indoor_bike_data(bytes(payload))
+        payload_bytes = bytes(payload)
+        watts, cadence_rpm, speed_kph, resistance_level = parse_indoor_bike_data(payload_bytes)
         self._latest = FtmsSample(
             watts=watts,
             cadence_rpm=cadence_rpm,
@@ -221,6 +232,8 @@ class FtmsSource:
             resistance_level=resistance_level,
             connected=True,
             ts=monotonic(),
+            raw_hex=payload_bytes.hex(),
+            control_point_hex=self._last_control_point_hex,
         )
 
     async def set_target_resistance(self, level: float) -> bool:
@@ -246,7 +259,8 @@ class FtmsSource:
         self._latest = FtmsSample.disconnected()
 
     def _on_control_point(self, _sender, payload: bytearray) -> None:
-        self._log(f"control point indication: {bytes(payload).hex()}")
+        self._last_control_point_hex = bytes(payload).hex()
+        self._log(f"control point indication: {self._last_control_point_hex}")
 
     async def close(self) -> None:
         if self._client is None:

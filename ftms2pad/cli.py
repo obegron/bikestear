@@ -239,6 +239,8 @@ class DebugLogger:
                 "speed_kph": float(getattr(f, "speed_kph", 0.0)) if f is not None else 0.0,
                 "resistance_level": float(getattr(f, "resistance_level", 0.0)) if f is not None else 0.0,
                 "connected": bool(getattr(f, "connected", False)) if f is not None else False,
+                "raw_hex": str(getattr(f, "raw_hex", "")) if f is not None else "",
+                "control_point_hex": str(getattr(f, "control_point_hex", "")) if f is not None else "",
             },
             "control": {
                 "steer": float(steer if steer is not None else 0.0),
@@ -772,12 +774,15 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                 p.source, debug, anchor, frame.shape[1], frame.shape[0], mirrored=not args.no_mirror
             )
 
-        def _resistance_phase(level: float, target: float, band: float) -> str:
-            if level < (target - band):
+        def _resistance_phase(level: float, target: float, _band: float) -> str:
+            if level < target:
                 return "left"
-            if level > (target + band):
+            if level > target:
                 return "right"
             return "neutral"
+
+        def _phase_target_count(phase_key: str) -> int:
+            return 40 if phase_key == "neutral" else 30
 
         if use_gui and cv2 is not None:
             try:
@@ -787,9 +792,21 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                 if float(getattr(args, "resistance_calibration_level", 0.0) or 0.0) > 0.0:
                     pedal_idle_started: float | None = None
                     target_level = float(getattr(args, "resistance_calibration_level", 5.0))
-                    band = max(0.1, float(getattr(args, "resistance_calibration_band", 0.5)))
+                    target_applied = False
+                    phase_order = ["neutral", "left", "neutral", "right", "neutral"]
+                    phase_titles = {
+                        "neutral": "CENTER",
+                        "left": "LEFT",
+                        "right": "RIGHT",
+                    }
+                    phase_idx = 0
                     while True:
                         f = await ftms.next()
+                        if not target_applied and bool(getattr(f, "connected", False)):
+                            target_applied = await ftms.set_target_resistance(target_level)
+                            if target_applied:
+                                await asyncio.sleep(0.25)
+                                f = await ftms.next()
                         p, frame, debug = vision.next_with_frame()
                         if frame is None:
                             await asyncio.sleep(1 / 30)
@@ -807,7 +824,7 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             anchor = _anchor_from_samples(cam_key)
                             if anchor is not None:
                                 anchors[cam_key] = anchor
-                        phase_key = _resistance_phase(float(getattr(f, "resistance_level", 0.0)), target_level, band)
+                        phase_key = phase_order[min(phase_idx, len(phase_order) - 1)]
                         accepted = False
                         if phase_key == "neutral":
                             if _accept_neutral_sample(p, debug):
@@ -825,15 +842,27 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                         ready_to_finish = bool(
                             len(buckets["neutral"]) >= 40 and len(buckets["left"]) >= 30 and len(buckets["right"]) >= 30
                         )
-                        if ready_to_finish and not pedaling_now:
+                        phase_done = len(buckets[phase_key]) >= _phase_target_count(phase_key)
+                        if not pedaling_now:
                             if pedal_idle_started is None:
                                 pedal_idle_started = monotonic()
+                            idle_elapsed = monotonic() - pedal_idle_started
+                            if phase_idx >= len(phase_order) - 1:
+                                if ready_to_finish and idle_elapsed >= 1.2:
+                                    cv2.destroyWindow(win)
+                                    break
+                            elif phase_done and idle_elapsed >= 0.8:
+                                phase_idx += 1
+                                pedal_idle_started = None
                         else:
                             pedal_idle_started = None
-                        title = f"RESISTANCE CAL: {phase_key.upper()}"
-                        hint = (
-                            f"Set resistance < {target_level - band:0.1f}=LEFT, {target_level:0.1f}=CENTER, > {target_level + band:0.1f}=RIGHT"
-                        )
+                        title = f"PEDAL CAL: {phase_titles[phase_key]}"
+                        if phase_key == "neutral":
+                            hint = "Pedal straight and stay centered. Stop pedaling briefly to advance."
+                        elif phase_key == "left":
+                            hint = "Lean left while pedaling. Stop pedaling briefly when done."
+                        else:
+                            hint = "Lean right while pedaling. Stop pedaling briefly when done."
                         display = frame.copy()
                         _draw_calibration_frame(
                             cv2,
@@ -849,29 +878,41 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                         )
                         cv2.putText(
                             display,
-                            f"res={f.resistance_level:0.1f} target={target_level:0.1f}  samples center={len(buckets['neutral'])} left={len(buckets['left'])} right={len(buckets['right'])}",
+                            (
+                                f"phase {phase_idx + 1}/{len(phase_order)}  target-res={target_level:0.1f}  "
+                                f"samples center={len(buckets['neutral'])} left={len(buckets['left'])} right={len(buckets['right'])}"
+                            ),
                             (20, 122),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.56,
+                            0.50,
                             (235, 235, 235),
                             1,
                             cv2.LINE_AA,
                         )
-                        if ready_to_finish:
+                        if phase_idx >= len(phase_order) - 1 and ready_to_finish:
                             status = "Stop pedaling to save"
                             if pedal_idle_started is not None:
                                 remaining = max(0.0, 1.2 - (monotonic() - pedal_idle_started))
                                 status = f"Saving in {remaining:0.1f}s"
-                            cv2.putText(
-                                display,
-                                status,
-                                (20, 148),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.58,
-                                (255, 210, 80),
-                                1,
-                                cv2.LINE_AA,
-                            )
+                        else:
+                            need = max(0, _phase_target_count(phase_key) - len(buckets[phase_key]))
+                            if phase_done:
+                                status = "Stop pedaling briefly to advance"
+                                if pedal_idle_started is not None:
+                                    remaining = max(0.0, 0.8 - (monotonic() - pedal_idle_started))
+                                    status = f"Advancing in {remaining:0.1f}s"
+                            else:
+                                status = f"Collecting {phase_titles[phase_key]}: need {need} more samples"
+                        cv2.putText(
+                            display,
+                            status,
+                            (20, 148),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.54,
+                            (255, 210, 80),
+                            1,
+                            cv2.LINE_AA,
+                        )
                         dbg.log(
                             p=p,
                             f=f,
@@ -881,10 +922,11 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             extra={
                                 "state": "resistance_calibration",
                                 "phase_key": phase_key,
+                                "phase_mode": "pedal",
+                                "phase_idx": phase_idx,
                                 "accepted": accepted,
                                 "ready_to_finish": ready_to_finish,
                                 "target_level": target_level,
-                                "band": band,
                             },
                         )
                         cv2.imshow(win, display)
@@ -899,10 +941,9 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             anchor_locked.clear()
                             buckets = {"neutral": [], "left": [], "right": []}
                             pedal_idle_started = None
+                            phase_idx = 0
+                            target_applied = False
                             vision.reset_tracking()
-                        if pedal_idle_started is not None and (monotonic() - pedal_idle_started) >= 1.2:
-                            cv2.destroyWindow(win)
-                            break
                         await asyncio.sleep(1 / 30)
                 elif getattr(args, "manual_calibration", False):
                     active_key: str | None = None
@@ -1155,21 +1196,75 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                 use_gui = False
 
         if not use_gui:
-            phase_frames = max(30, int(float(args.phase_seconds) * 30))
             print("GUI unavailable; using text calibration mode.")
-            for title, key, hint in phases:
-                print(f"Get ready ({prep_seconds:.1f}s): {title} - {hint}")
-                await asyncio.sleep(prep_seconds)
-                print(f"Collecting {title} for {phase_seconds:.1f}s...")
-                for _ in range(phase_frames):
+            if float(getattr(args, "resistance_calibration_level", 0.0) or 0.0) > 0.0:
+                phase_order = ["neutral", "left", "neutral", "right", "neutral"]
+                phase_titles = {"neutral": "CENTER", "left": "LEFT", "right": "RIGHT"}
+                phase_idx = 0
+                pedal_idle_started: float | None = None
+                target_level = float(getattr(args, "resistance_calibration_level", 5.0))
+                target_applied = False
+                while True:
+                    f = await ftms.next()
+                    if not target_applied and bool(getattr(f, "connected", False)):
+                        target_applied = await ftms.set_target_resistance(target_level)
+                    phase_key = phase_order[min(phase_idx, len(phase_order) - 1)]
                     p = vision.next()
-                    if p.confidence >= _pose_conf_threshold(p.source):
-                        buckets[key].append(p.steer_raw)
+                    accept_sample = p.confidence >= _pose_conf_threshold(p.source)
+                    if accept_sample:
+                        buckets[phase_key].append(p.steer_raw)
+                    pedaling_now = _pedaling_started(
+                        f,
+                        float(getattr(args, "start_cadence_rpm", 20.0)),
+                        float(getattr(args, "start_watts", 35.0)),
+                    )
+                    ready_to_finish = bool(
+                        len(buckets["neutral"]) >= 40 and len(buckets["left"]) >= 30 and len(buckets["right"]) >= 30
+                    )
+                    phase_done = len(buckets[phase_key]) >= _phase_target_count(phase_key)
+                    if not pedaling_now:
+                        if pedal_idle_started is None:
+                            pedal_idle_started = monotonic()
+                        idle_elapsed = monotonic() - pedal_idle_started
+                        if phase_idx >= len(phase_order) - 1:
+                            if ready_to_finish and idle_elapsed >= 1.2:
+                                break
+                        elif phase_done and idle_elapsed >= 0.8:
+                            phase_idx += 1
+                            pedal_idle_started = None
+                            phase_key = phase_order[min(phase_idx, len(phase_order) - 1)]
+                            print(f"Advance: {phase_titles[phase_key]}")
+                    else:
+                        pedal_idle_started = None
                     dbg.log(
                         p=p,
-                        extra={"phase": title, "phase_key": key, "state": "collect-text"},
+                        f=f,
+                        extra={
+                            "phase": phase_titles[phase_key],
+                            "phase_key": phase_key,
+                            "phase_mode": "pedal",
+                            "phase_idx": phase_idx,
+                            "state": "collect-text",
+                            "accepted": accept_sample,
+                            "ready_to_finish": ready_to_finish,
+                        },
                     )
                     await asyncio.sleep(1 / 30)
+            else:
+                phase_frames = max(30, int(float(args.phase_seconds) * 30))
+                for title, key, hint in phases:
+                    print(f"Get ready ({prep_seconds:.1f}s): {title} - {hint}")
+                    await asyncio.sleep(prep_seconds)
+                    print(f"Collecting {title} for {phase_seconds:.1f}s...")
+                    for _ in range(phase_frames):
+                        p = vision.next()
+                        if p.confidence >= _pose_conf_threshold(p.source):
+                            buckets[key].append(p.steer_raw)
+                        dbg.log(
+                            p=p,
+                            extra={"phase": title, "phase_key": key, "state": "collect-text"},
+                        )
+                        await asyncio.sleep(1 / 30)
 
         neutral_samples = buckets["neutral"]
         left_vals = buckets["left"]

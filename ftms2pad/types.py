@@ -20,7 +20,18 @@ class FtmsSample:
     resistance_level: float
     connected: bool
     ts: float
+    raw_hex: str = ""
+    control_point_hex: str = ""
 
     @classmethod
     def disconnected(cls) -> "FtmsSample":
-        return cls(watts=0.0, cadence_rpm=0.0, speed_kph=0.0, resistance_level=0.0, connected=False, ts=monotonic())
+        return cls(
+            watts=0.0,
+            cadence_rpm=0.0,
+            speed_kph=0.0,
+            resistance_level=0.0,
+            connected=False,
+            ts=monotonic(),
+            raw_hex="",
+            control_point_hex="",
+        )
