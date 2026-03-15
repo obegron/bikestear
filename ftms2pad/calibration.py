@@ -1,10 +1,29 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ftms2pad.fusion import Calibrator
+
+@dataclass(slots=True)
+class Calibrator:
+    neutral: float = 0.0
+    left_peak: float = -0.7
+    right_peak: float = 0.7
+    flip_sign: bool = False
+    anchor_x_norm: float | None = None
+    anchor_y_norm: float | None = None
+
+    def normalize(self, raw: float) -> float:
+        if self.flip_sign:
+            raw = (2.0 * self.neutral) - raw
+        left_span = abs(self.neutral - self.left_peak)
+        right_span = abs(self.right_peak - self.neutral)
+        if raw >= self.neutral:
+            span = max(right_span, 1e-4)
+        else:
+            span = max(left_span, 1e-4)
+        return max(-1.0, min(1.0, (raw - self.neutral) / span))
 
 
 def load_calibration(path: Path) -> Calibrator:

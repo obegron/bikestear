@@ -127,6 +127,9 @@ class FtmsSource:
             )
 
         await self._ensure_connected()
+        latest_age = monotonic() - self._latest.ts
+        if self._client is not None and getattr(self._client, "is_connected", False) and latest_age <= 0.25:
+            return self._latest
         await asyncio.sleep(0.02)
 
         if monotonic() - self._latest.ts > 2.0:

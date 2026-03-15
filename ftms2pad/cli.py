@@ -175,6 +175,8 @@ class DebugLogger:
         self.writer = None
         self._cv2 = None
         self._t_last_frame = 0.0
+        self._t_last_snapshot = 0.0
+        self._last_snapshot_key = ""
         self.debug_fps = max(1.0, float(debug_fps))
         self.size = (max(160, int(width)), max(120, int(height)))
         self.frame_idx = 0
@@ -186,6 +188,7 @@ class DebugLogger:
         root = Path(str(base_dir))
         self.session_dir = root / f"{mode}-{int(ts)}"
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        (self.session_dir / "keyframes").mkdir(parents=True, exist_ok=True)
         self.events_fp = (self.session_dir / "events.jsonl").open("w", encoding="utf-8", buffering=1)
         (self.session_dir / "meta.json").write_text(
             json.dumps(
@@ -266,7 +269,33 @@ class DebugLogger:
             return
         out = self._cv2.resize(frame, self.size, interpolation=self._cv2.INTER_AREA)
         self.writer.write(out)
+        self._maybe_write_snapshot(out, extra or {})
         self.frame_idx += 1
+
+    def _maybe_write_snapshot(self, frame, extra: dict[str, object]) -> None:
+        if self.session_dir is None or self._cv2 is None:
+            return
+        now = monotonic()
+        state = str(extra.get("state", ""))
+        phase = str(extra.get("phase_key", ""))
+        key = f"{state}:{phase}"
+        should_write = False
+        if key != self._last_snapshot_key:
+            should_write = True
+        elif now - self._t_last_snapshot >= 2.0:
+            should_write = True
+        if not should_write:
+            return
+        snapshot_name = f"{self.frame_idx:05d}-{state or 'frame'}"
+        if phase:
+            snapshot_name += f"-{phase}"
+        snapshot_path = self.session_dir / "keyframes" / f"{snapshot_name}.jpg"
+        try:
+            self._cv2.imwrite(str(snapshot_path), frame)
+            self._t_last_snapshot = now
+            self._last_snapshot_key = key
+        except Exception:
+            pass
 
     def close(self) -> None:
         if self.events_fp is not None:

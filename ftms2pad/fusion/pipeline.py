@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
+from ftms2pad.calibration import Calibrator
 from ftms2pad.profiles.loader import Profile
 
 
@@ -18,27 +17,6 @@ def _apply_deadzone(value: float, dz: float) -> float:
 def _lpf(prev: float, current: float, alpha: float) -> float:
     alpha = _clamp(alpha, 0.01, 1.0)
     return prev * (1.0 - alpha) + current * alpha
-
-
-@dataclass(slots=True)
-class Calibrator:
-    neutral: float = 0.0
-    left_peak: float = -0.7
-    right_peak: float = 0.7
-    flip_sign: bool = False
-    anchor_x_norm: float | None = None
-    anchor_y_norm: float | None = None
-
-    def normalize(self, raw: float) -> float:
-        if self.flip_sign:
-            raw = (2.0 * self.neutral) - raw
-        left_span = abs(self.neutral - self.left_peak)
-        right_span = abs(self.right_peak - self.neutral)
-        if raw >= self.neutral:
-            span = max(right_span, 1e-4)
-        else:
-            span = max(left_span, 1e-4)
-        return _clamp((raw - self.neutral) / span)
 
 
 class FusionPipeline:

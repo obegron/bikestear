@@ -12,10 +12,11 @@ class FtmsParserTests(unittest.TestCase):
             0xB4, 0x00,  # cadence 180 -> 90.0 rpm
             0xFA, 0x00,  # power 250 W
         ])
-        watts, cadence, speed = parse_indoor_bike_data(payload)
+        watts, cadence, speed, resistance = parse_indoor_bike_data(payload)
         self.assertEqual(watts, 250.0)
         self.assertEqual(cadence, 90.0)
         self.assertEqual(speed, 30.0)
+        self.assertEqual(resistance, 0.0)
 
     def test_parse_more_data_flag_skips_speed(self):
         # flags: more data (bit0), power present (bit6)
@@ -23,10 +24,11 @@ class FtmsParserTests(unittest.TestCase):
             0x41, 0x00,
             0xC8, 0x00,  # power 200 W
         ])
-        watts, cadence, speed = parse_indoor_bike_data(payload)
+        watts, cadence, speed, resistance = parse_indoor_bike_data(payload)
         self.assertEqual(watts, 200.0)
         self.assertEqual(cadence, 0.0)
         self.assertEqual(speed, 0.0)
+        self.assertEqual(resistance, 0.0)
 
 
 if __name__ == "__main__":

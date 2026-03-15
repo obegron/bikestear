@@ -80,19 +80,46 @@ def _create_pose() -> Any:
 class VisionTracker:
     def __init__(self, steering_mode: str, camera: str = "auto", width: int = 640, height: int = 360) -> None:
         self.steering_mode = steering_mode
-        self.camera_idx = self._pick_camera(camera)
-        self._camera_label = camera_name(self.camera_idx).lower()
-        self._is_ir_camera = "ir" in self._camera_label
         self._use_bike_mask = self.steering_mode == "bike_relative_torso"
         self._vision_width = max(160, int(width))
         self._vision_height = max(120, int(height))
-        self.cap = cv2.VideoCapture(self.camera_idx)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._vision_width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._vision_height)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
         self._t = 0.0
-        self._pose = None if self._use_bike_mask else _create_pose()
+        self._morph_kernel_5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        self._morph_kernel_7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        self.camera_idx = self._pick_camera(camera)
+        self._camera_label = camera_name(self.camera_idx).lower()
+        self._is_ir_camera = "ir" in self._camera_label
+        self.cap = self._init_capture()
+        self._pose = self._init_pose()
         self._backend = "bike_mask" if self._use_bike_mask else ("mediapipe" if self._pose is not None else "blob")
+        self._init_bike_tracking_state()
+        self._init_face_tracking_state()
+        self._hog = self._init_hog()
+        self._face, self._face_profile = self._init_face_detectors()
+        self._last_debug: dict[str, object] = {}
+
+    def _init_capture(self):
+        cap = cv2.VideoCapture(self.camera_idx)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._vision_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._vision_height)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        return cap
+
+    def _init_pose(self):
+        return None if self._use_bike_mask else _create_pose()
+
+    def _init_hog(self):
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        return hog
+
+    def _init_face_detectors(self):
+        return (
+            cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml"),
+            cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml"),
+        )
+
+    def _init_bike_tracking_state(self) -> None:
         self._bg = cv2.createBackgroundSubtractorMOG2(history=120, varThreshold=32, detectShadows=False)
         self._bike_bg = None
         self._bike_last_bbox: tuple[int, int, int, int] | None = None
@@ -100,17 +127,14 @@ class VisionTracker:
         self._bike_anchor_x: float | None = None
         self._bike_anchor_samples: list[float] = []
         self._bike_warmup_until = monotonic() + 1.0 if self._use_bike_mask else 0.0
-        self._hog = cv2.HOGDescriptor()
-        self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        self._face = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        self._face_profile = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
+
+    def _init_face_tracking_state(self) -> None:
         self._face_last_bbox: tuple[int, int, int, int] | None = None
         self._face_last_ts: float = 0.0
         self._face_last_hard_bbox: tuple[int, int, int, int] | None = None
         self._face_last_hard_ts: float = 0.0
         self._face_template = None
         self._tracker = None
-        self._last_debug: dict[str, object] = {}
 
     def _create_tracker(self):
         try:
@@ -162,6 +186,9 @@ class VisionTracker:
         cameras = list_cameras()
         if not cameras:
             return 0
+        if self._use_bike_mask:
+            visible = [idx for idx in cameras if "ir" not in camera_name(idx).lower()]
+            return visible[0] if visible else cameras[0]
         if mp is None:
             return cameras[0]
 
@@ -170,6 +197,8 @@ class VisionTracker:
             cap = cv2.VideoCapture(idx)
             if not cap.isOpened():
                 continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 180)
             pose = _create_pose()
             if pose is None:
                 cap.release()
@@ -177,7 +206,7 @@ class VisionTracker:
             total = 0.0
             frames = 0
             gray_like = 0
-            for _ in range(8):
+            for _ in range(3):
                 ok, frame = cap.read()
                 if not ok:
                     continue
@@ -235,10 +264,9 @@ class VisionTracker:
 
         diff = cv2.absdiff(gray, cv2.convertScaleAbs(self._bike_bg))
         _, mask = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.dilate(mask, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._morph_kernel_5)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._morph_kernel_5)
+        mask = cv2.dilate(mask, self._morph_kernel_5, iterations=1)
 
         body_top = int(h * 0.12)
         body_bottom = int(h * 0.82)
@@ -415,7 +443,7 @@ class VisionTracker:
                 continue
             candidates.append((int(x), int(y), int(fw), int(fh), "frontal"))
 
-        if self._face_profile is not None and not self._face_profile.empty():
+        if not candidates and self._face_profile is not None and not self._face_profile.empty():
             prof_l = self._face_profile.detectMultiScale(
                 roi_search,
                 scaleFactor=1.1,
@@ -730,8 +758,8 @@ class VisionTracker:
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         fg = self._bg.apply(gray)
         _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
-        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        fg = cv2.morphologyEx(fg, cv2.MORPH_DILATE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, self._morph_kernel_5)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_DILATE, self._morph_kernel_7)
 
         contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
