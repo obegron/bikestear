@@ -696,6 +696,9 @@ async def _wait_for_pedaling(
                 if _pedaling_started(f, args.start_cadence_rpm, args.start_watts):
                     return 0
                 await asyncio.sleep(1 / 30)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("Calibration canceled.")
+        return 1
     finally:
         await ftms.close()
 
@@ -799,9 +802,24 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
 
         def _accept_side_sample(p, debug: dict, anchor, frame) -> bool:
             conf_th = _pose_conf_threshold(p.source)
-            return p.confidence >= conf_th and _anchor_gate_pass(
-                p.source, debug, anchor, frame.shape[1], frame.shape[0], mirrored=not args.no_mirror
+            return (
+                p.confidence >= conf_th
+                and not bool(debug.get("warmup", False))
+                and not bool(debug.get("anchor_pending", False))
+                and not bool(debug.get("held", False))
+                and _anchor_gate_pass(
+                    p.source, debug, anchor, frame.shape[1], frame.shape[0], mirrored=not args.no_mirror
+                )
             )
+
+        def _phase_sign_accepts(phase_key: str, raw: float, neutral_vals: list[float]) -> bool:
+            if phase_key not in ("left", "right") or len(neutral_vals) < 20:
+                return True
+            neutral_mid = median(neutral_vals)
+            margin = 0.06
+            if phase_key == "left":
+                return raw < (neutral_mid - margin)
+            return raw > (neutral_mid + margin)
 
         def _resistance_phase(level: float, target: float, _band: float) -> str:
             if level < target:
@@ -853,14 +871,21 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             anchor = _anchor_from_samples(cam_key)
                             if anchor is not None:
                                 anchors[cam_key] = anchor
+                            if len(samples) >= 8:
+                                anchor_locked.add(cam_key)
+                        center_locked = anchor is not None and cam_key in anchor_locked
                         phase_key = phase_order[min(phase_idx, len(phase_order) - 1)]
                         accepted = False
-                        if phase_key == "neutral":
+                        if phase_idx == 0 and not center_locked:
+                            accepted = False
+                        elif phase_key == "neutral":
                             if _accept_neutral_sample(p, debug):
                                 buckets["neutral"].append(p.steer_raw)
                                 accepted = True
                         else:
-                            if _accept_side_sample(p, debug, anchor, frame):
+                            if _accept_side_sample(p, debug, anchor, frame) and _phase_sign_accepts(
+                                phase_key, p.steer_raw, buckets["neutral"]
+                            ):
                                 buckets[phase_key].append(p.steer_raw)
                                 accepted = True
                         pedaling_now = _pedaling_started(
@@ -872,6 +897,8 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             len(buckets["neutral"]) >= 40 and len(buckets["left"]) >= 30 and len(buckets["right"]) >= 30
                         )
                         phase_done = len(buckets[phase_key]) >= _phase_target_count(phase_key)
+                        if phase_idx == 0 and not center_locked:
+                            phase_done = False
                         if not pedaling_now:
                             if pedal_idle_started is None:
                                 pedal_idle_started = monotonic()
@@ -925,7 +952,9 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                                 status = f"Saving in {remaining:0.1f}s"
                         else:
                             need = max(0, _phase_target_count(phase_key) - len(buckets[phase_key]))
-                            if phase_done:
+                            if phase_idx == 0 and not center_locked:
+                                status = "Locking center before calibration starts"
+                            elif phase_done:
                                 status = "Stop pedaling briefly to advance"
                                 if pedal_idle_started is not None:
                                     remaining = max(0.0, 0.8 - (monotonic() - pedal_idle_started))
@@ -1371,6 +1400,9 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
             f"flip_sign={flip_sign} anchor=({anchor_x_norm},{anchor_y_norm})"
         )
         return 0
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("Calibration canceled.")
+        return 1
     finally:
         await ftms.close()
         dbg.close()
