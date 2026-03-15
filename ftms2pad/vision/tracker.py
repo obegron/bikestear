@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import atan2
+from statistics import median
 import os
 from pathlib import Path
 from time import monotonic
@@ -97,6 +98,7 @@ class VisionTracker:
         self._bike_last_bbox: tuple[int, int, int, int] | None = None
         self._bike_last_ts = 0.0
         self._bike_anchor_x: float | None = None
+        self._bike_anchor_samples: list[float] = []
         self._bike_warmup_until = monotonic() + 1.0 if self._use_bike_mask else 0.0
         self._hog = cv2.HOGDescriptor()
         self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
@@ -238,11 +240,22 @@ class VisionTracker:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.dilate(mask, kernel, iterations=1)
 
-        mask[int(h * 0.86) :, :] = 0
-
         body_top = int(h * 0.12)
         body_bottom = int(h * 0.82)
         torso = mask[body_top:body_bottom, :]
+        roi_x0 = 0
+        roi_y0 = body_top
+        roi_x1 = w
+        roi_y1 = body_bottom
+        if self._bike_last_bbox is not None and (monotonic() - self._bike_last_ts) < 1.2:
+            lx, ly, lw, lh = self._bike_last_bbox
+            pad_x = max(int(lw * 1.2), int(w * 0.18))
+            pad_y = max(int(lh * 0.8), int(h * 0.12))
+            roi_x0 = max(0, lx - pad_x)
+            roi_x1 = min(w, lx + lw + pad_x)
+            roi_y0 = max(body_top, ly - pad_y)
+            roi_y1 = min(body_bottom, ly + lh + pad_y)
+            torso = mask[roi_y0:roi_y1, roi_x0:roi_x1]
 
         contours, _ = cv2.findContours(torso, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         best = None
@@ -253,9 +266,15 @@ class VisionTracker:
             if area < (w * h) * 0.008:
                 continue
             x, y, bw, bh = cv2.boundingRect(contour)
-            y += body_top
-            cx = x + bw * 0.5
-            cy = y + bh * 0.5
+            x += roi_x0
+            y += roi_y0
+            m = cv2.moments(contour)
+            if abs(m["m00"]) > 1e-5:
+                cx = roi_x0 + (float(m["m10"]) / float(m["m00"]))
+                cy = roi_y0 + (float(m["m01"]) / float(m["m00"]))
+            else:
+                cx = x + bw * 0.5
+                cy = y + bh * 0.5
             if bw > int(w * 0.72) or bh > int(h * 0.72):
                 continue
             if cy < h * 0.18 or cy > h * 0.78:
@@ -275,7 +294,7 @@ class VisionTracker:
             if best_score is None or score > best_score:
                 best_score = score
                 best_area = area
-                best = (x, y, bw, bh)
+                best = (x, y, bw, bh, cx, cy)
 
         # Slowly adapt background, excluding detected torso so the rider remains foreground.
         learn_mask = cv2.bitwise_not(mask)
@@ -285,7 +304,8 @@ class VisionTracker:
             if self._bike_last_bbox is not None and (monotonic() - self._bike_last_ts) < 0.45:
                 x, y, bw, bh = self._bike_last_bbox
                 cx = x + bw * 0.5
-                raw = (0.5 - (cx / max(w, 1))) * 1.7
+                anchor_x = self._bike_anchor_x if self._bike_anchor_x is not None else (w * 0.5)
+                raw = ((anchor_x - cx) / max(w * 0.22, 1.0)) * 1.4
                 debug = {
                     "kind": "bike_mask",
                     "bbox": (int(x), int(y), int(bw), int(bh)),
@@ -295,29 +315,40 @@ class VisionTracker:
                 return max(-1.0, min(1.0, raw)), 0.18, debug
             return 0.0, 0.0, {"kind": "bike_mask", "miss": True}
 
-        x, y, bw, bh = best
-        cx = x + bw * 0.5
+        x, y, bw, bh, cx, cy = best
         if monotonic() < self._bike_warmup_until:
             return 0.0, 0.0, {
                 "kind": "bike_mask",
                 "bbox": (int(x), int(y), int(bw), int(bh)),
-                "centroid": (int(cx), int(y + bh * 0.5)),
+                "centroid": (int(cx), int(cy)),
                 "warmup": True,
             }
         self._bike_last_bbox = (x, y, bw, bh)
         self._bike_last_ts = monotonic()
         if self._bike_anchor_x is None:
-            self._bike_anchor_x = cx
+            self._bike_anchor_samples.append(float(cx))
+            if len(self._bike_anchor_samples) > 15:
+                self._bike_anchor_samples = self._bike_anchor_samples[-15:]
+            if len(self._bike_anchor_samples) < 6:
+                return 0.0, 0.0, {
+                    "kind": "bike_mask",
+                    "bbox": (int(x), int(y), int(bw), int(bh)),
+                    "centroid": (int(cx), int(cy)),
+                    "warmup": True,
+                    "anchor_pending": True,
+                }
+            self._bike_anchor_x = float(median(self._bike_anchor_samples))
         # Track torso shift relative to learned bike/rider neutral, not frame center.
         anchor_x = self._bike_anchor_x
-        raw = ((anchor_x - cx) / max(w * 0.22, 1.0)) * 1.4
+        raw = ((anchor_x - cx) / max(w * 0.16, 1.0)) * 1.8
         conf = max(0.2, min(1.0, best_area / ((w * h) * 0.09)))
         debug = {
             "kind": "bike_mask",
             "bbox": (int(x), int(y), int(bw), int(bh)),
-            "centroid": (int(cx), int(y + bh * 0.5)),
+            "centroid": (int(cx), int(cy)),
             "area": best_area,
             "anchor_x": float(anchor_x),
+            "roi": (int(roi_x0), int(roi_y0), int(max(1, roi_x1 - roi_x0)), int(max(1, roi_y1 - roi_y0))),
         }
         return max(-1.0, min(1.0, raw)), conf, debug
 
@@ -781,4 +812,5 @@ class VisionTracker:
         self._bike_last_bbox = None
         self._bike_last_ts = 0.0
         self._bike_anchor_x = None
+        self._bike_anchor_samples = []
         self._bike_warmup_until = monotonic() + 1.0 if self._use_bike_mask else 0.0

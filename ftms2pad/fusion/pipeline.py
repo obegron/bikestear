@@ -25,8 +25,11 @@ class Calibrator:
     neutral: float = 0.0
     left_peak: float = -0.7
     right_peak: float = 0.7
+    flip_sign: bool = False
 
     def normalize(self, raw: float) -> float:
+        if self.flip_sign:
+            raw = (2.0 * self.neutral) - raw
         left_span = abs(self.neutral - self.left_peak)
         right_span = abs(self.right_peak - self.neutral)
         if raw >= self.neutral:

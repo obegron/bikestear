@@ -15,6 +15,7 @@ def load_calibration(path: Path) -> Calibrator:
         neutral=float(data.get("neutral", 0.0)),
         left_peak=float(data.get("left_peak", -0.7)),
         right_peak=float(data.get("right_peak", 0.7)),
+        flip_sign=bool(data.get("flip_sign", False)),
     )
 
 

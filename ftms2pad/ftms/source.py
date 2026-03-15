@@ -18,6 +18,7 @@ INDOOR_BIKE_DATA_CHAR_UUID = "00002ad2-0000-1000-8000-00805f9b34fb"
 FITNESS_MACHINE_CONTROL_POINT_CHAR_UUID = "00002ad9-0000-1000-8000-00805f9b34fb"
 _FTMS_REQUEST_CONTROL = b"\x00"
 _FTMS_START_OR_RESUME = b"\x07"
+_FTMS_SET_TARGET_RESISTANCE_LEVEL = 0x04
 _MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 
 
@@ -30,9 +31,9 @@ def _s16(data: bytes, off: int) -> tuple[int, int]:
     return value, off + 2
 
 
-def parse_indoor_bike_data(payload: bytes) -> tuple[float, float, float]:
+def parse_indoor_bike_data(payload: bytes) -> tuple[float, float, float, float]:
     if len(payload) < 2:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     flags = int.from_bytes(payload[0:2], "little")
     off = 2
@@ -53,14 +54,17 @@ def parse_indoor_bike_data(payload: bytes) -> tuple[float, float, float]:
     if (flags & (1 << 4)) and off + 3 <= len(payload):
         off += 3  # total distance
     if (flags & (1 << 5)) and off + 2 <= len(payload):
-        _, off = _s16(payload, off)  # resistance level
+        resistance_raw, off = _s16(payload, off)  # resistance level, 0.1 units in FTMS
+        resistance_level = resistance_raw / 10.0
+    else:
+        resistance_level = 0.0
 
     watts = 0.0
     if (flags & (1 << 6)) and off + 2 <= len(payload):
         power_raw, off = _s16(payload, off)
         watts = float(max(0, power_raw))
 
-    return watts, cadence_rpm, speed_kph
+    return watts, cadence_rpm, speed_kph, resistance_level
 
 
 async def list_ble_devices(timeout: float = 4.0) -> list[tuple[str, str, bool]]:
@@ -110,7 +114,7 @@ class FtmsSource:
             watts = max(0.0, 180.0 + 120.0 * sin(self._t * 0.6))
             cadence = max(0.0, 78.0 + 12.0 * sin(self._t * 0.45 + 0.2))
             speed = max(0.0, 28.0 + 8.0 * sin(self._t * 0.5 - 0.1))
-            return FtmsSample(watts=watts, cadence_rpm=cadence, speed_kph=speed, connected=True, ts=monotonic())
+            return FtmsSample(watts=watts, cadence_rpm=cadence, speed_kph=speed, resistance_level=0.0, connected=True, ts=monotonic())
 
         await self._ensure_connected()
         await asyncio.sleep(0.02)
@@ -209,14 +213,32 @@ class FtmsSource:
         return None
 
     def _on_indoor_bike_data(self, _sender, payload: bytearray) -> None:
-        watts, cadence_rpm, speed_kph = parse_indoor_bike_data(bytes(payload))
+        watts, cadence_rpm, speed_kph, resistance_level = parse_indoor_bike_data(bytes(payload))
         self._latest = FtmsSample(
             watts=watts,
             cadence_rpm=cadence_rpm,
             speed_kph=speed_kph,
+            resistance_level=resistance_level,
             connected=True,
             ts=monotonic(),
         )
+
+    async def set_target_resistance(self, level: float) -> bool:
+        if self.bike == "sim":
+            return False
+        await self._ensure_connected()
+        client = self._client
+        if client is None or not getattr(client, "is_connected", False):
+            return False
+        raw = int(round(float(level) * 10.0))
+        payload = bytes([_FTMS_SET_TARGET_RESISTANCE_LEVEL]) + int(raw).to_bytes(2, "little", signed=True)
+        try:
+            await client.write_gatt_char(FITNESS_MACHINE_CONTROL_POINT_CHAR_UUID, payload, response=True)
+            self._log(f"sent set_target_resistance {level:.1f}")
+            return True
+        except Exception:
+            self._log(f"set_target_resistance failed: {level:.1f}")
+            return False
 
     def _on_disconnected(self, _client) -> None:
         self._client = None
