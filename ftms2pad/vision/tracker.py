@@ -82,6 +82,7 @@ class VisionTracker:
         self.camera_idx = self._pick_camera(camera)
         self._camera_label = camera_name(self.camera_idx).lower()
         self._is_ir_camera = "ir" in self._camera_label
+        self._use_bike_mask = self.steering_mode == "bike_relative_torso"
         self._vision_width = max(160, int(width))
         self._vision_height = max(120, int(height))
         self.cap = cv2.VideoCapture(self.camera_idx)
@@ -89,9 +90,14 @@ class VisionTracker:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._vision_height)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
         self._t = 0.0
-        self._pose = _create_pose()
-        self._backend = "mediapipe" if self._pose is not None else "blob"
+        self._pose = None if self._use_bike_mask else _create_pose()
+        self._backend = "bike_mask" if self._use_bike_mask else ("mediapipe" if self._pose is not None else "blob")
         self._bg = cv2.createBackgroundSubtractorMOG2(history=120, varThreshold=32, detectShadows=False)
+        self._bike_bg = None
+        self._bike_last_bbox: tuple[int, int, int, int] | None = None
+        self._bike_last_ts = 0.0
+        self._bike_anchor_x: float | None = None
+        self._bike_warmup_until = monotonic() + 1.0 if self._use_bike_mask else 0.0
         self._hog = cv2.HOGDescriptor()
         self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
         self._face = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -214,6 +220,106 @@ class VisionTracker:
         raw = 0.6 * roll_norm + 0.4 * shift_norm
         conf = min(ls.visibility, rs.visibility, lh.visibility, rh.visibility)
         return raw, conf
+
+    def _bike_relative_torso_lean(self, frame) -> tuple[float, float, dict[str, object]]:
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (7, 7), 0)
+
+        if self._bike_bg is None:
+            self._bike_bg = gray.astype("float32")
+            self._last_debug = {"kind": "bike_mask", "warmup": True}
+            return 0.0, 0.0, {"kind": "bike_mask", "warmup": True}
+
+        diff = cv2.absdiff(gray, cv2.convertScaleAbs(self._bike_bg))
+        _, mask = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+        mask[int(h * 0.86) :, :] = 0
+
+        body_top = int(h * 0.12)
+        body_bottom = int(h * 0.82)
+        torso = mask[body_top:body_bottom, :]
+
+        contours, _ = cv2.findContours(torso, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        best_score = None
+        best_area = 0.0
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < (w * h) * 0.008:
+                continue
+            x, y, bw, bh = cv2.boundingRect(contour)
+            y += body_top
+            cx = x + bw * 0.5
+            cy = y + bh * 0.5
+            if bw > int(w * 0.72) or bh > int(h * 0.72):
+                continue
+            if cy < h * 0.18 or cy > h * 0.78:
+                continue
+            continuity = 0.0
+            if self._bike_last_bbox is not None:
+                lx, ly, lw, lh = self._bike_last_bbox
+                lcx = lx + lw * 0.5
+                lcy = ly + lh * 0.5
+                dist = ((cx - lcx) ** 2 + (cy - lcy) ** 2) ** 0.5
+                continuity = 1.0 - min(1.0, dist / max(1.0, w * 0.35))
+            anchor_bias = 0.0
+            if self._bike_anchor_x is not None:
+                anchor_bias = 1.0 - min(1.0, abs(cx - self._bike_anchor_x) / max(1.0, w * 0.35))
+            area_score = min(1.0, area / ((w * h) * 0.09))
+            score = (0.45 * area_score) + (0.40 * continuity) + (0.15 * anchor_bias)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_area = area
+                best = (x, y, bw, bh)
+
+        # Slowly adapt background, excluding detected torso so the rider remains foreground.
+        learn_mask = cv2.bitwise_not(mask)
+        cv2.accumulateWeighted(gray, self._bike_bg, 0.015, mask=learn_mask)
+
+        if best is None:
+            if self._bike_last_bbox is not None and (monotonic() - self._bike_last_ts) < 0.45:
+                x, y, bw, bh = self._bike_last_bbox
+                cx = x + bw * 0.5
+                raw = (0.5 - (cx / max(w, 1))) * 1.7
+                debug = {
+                    "kind": "bike_mask",
+                    "bbox": (int(x), int(y), int(bw), int(bh)),
+                    "centroid": (int(cx), int(y + bh * 0.5)),
+                    "held": True,
+                }
+                return max(-1.0, min(1.0, raw)), 0.18, debug
+            return 0.0, 0.0, {"kind": "bike_mask", "miss": True}
+
+        x, y, bw, bh = best
+        cx = x + bw * 0.5
+        if monotonic() < self._bike_warmup_until:
+            return 0.0, 0.0, {
+                "kind": "bike_mask",
+                "bbox": (int(x), int(y), int(bw), int(bh)),
+                "centroid": (int(cx), int(y + bh * 0.5)),
+                "warmup": True,
+            }
+        self._bike_last_bbox = (x, y, bw, bh)
+        self._bike_last_ts = monotonic()
+        if self._bike_anchor_x is None:
+            self._bike_anchor_x = cx
+        # Track torso shift relative to learned bike/rider neutral, not frame center.
+        anchor_x = self._bike_anchor_x
+        raw = ((anchor_x - cx) / max(w * 0.22, 1.0)) * 1.4
+        conf = max(0.2, min(1.0, best_area / ((w * h) * 0.09)))
+        debug = {
+            "kind": "bike_mask",
+            "bbox": (int(x), int(y), int(bw), int(bh)),
+            "centroid": (int(cx), int(y + bh * 0.5)),
+            "area": best_area,
+            "anchor_x": float(anchor_x),
+        }
+        return max(-1.0, min(1.0, raw)), conf, debug
 
     def _face_lean(self, frame) -> tuple[float, float, dict[str, object]] | None:
         if self._face is None or self._face.empty():
@@ -603,6 +709,10 @@ class VisionTracker:
         return max(-1.0, min(1.0, raw)), conf, debug
 
     def _sample_from_frame(self, frame) -> PoseSample:
+        if self._use_bike_mask:
+            raw, conf, debug = self._bike_relative_torso_lean(frame)
+            self._last_debug = debug
+            return PoseSample(steer_raw=raw, confidence=conf, source="camera-bike", ts=monotonic())
         if self._pose is None:
             face = self._face_lean(frame)
             if face is not None:
@@ -667,3 +777,8 @@ class VisionTracker:
         self._face_last_hard_ts = 0.0
         self._face_template = None
         self._tracker = None
+        self._bike_bg = None
+        self._bike_last_bbox = None
+        self._bike_last_ts = 0.0
+        self._bike_anchor_x = None
+        self._bike_warmup_until = monotonic() + 1.0 if self._use_bike_mask else 0.0

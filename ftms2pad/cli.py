@@ -276,6 +276,8 @@ class DebugLogger:
 def _pose_conf_threshold(source: str) -> float:
     if source == "camera-face":
         return 0.18
+    if source == "camera-bike":
+        return 0.16
     if source in ("camera-hog", "camera-blob"):
         return 0.1
     return 0.3
@@ -291,7 +293,7 @@ def _percentile(values: list[float], p: float) -> float:
 
 def _debug_centroid_px(debug: dict, w: int, h: int, mirrored: bool) -> tuple[int, int] | None:
     kind = str(debug.get("kind", ""))
-    if kind in ("face", "blob"):
+    if kind in ("face", "blob", "bike_mask"):
         centroid = debug.get("centroid")
         if isinstance(centroid, tuple) and len(centroid) == 2:
             x, y = int(centroid[0]), int(centroid[1])
@@ -344,6 +346,8 @@ def _anchor_gate_pass(
         if detector == "tracker":
             return dx <= int(w * 0.22) and dy <= int(h * 0.22)
         return dx <= int(w * 0.28) and dy <= int(h * 0.30)
+    if source == "camera-bike":
+        return dx <= int(w * 0.30) and dy <= int(h * 0.28)
     if source in ("camera-hog", "camera-blob"):
         return dx <= int(w * 0.45)
     return True
@@ -401,6 +405,27 @@ def _draw_tracking_overlay(cv2, frame, debug: dict, mirrored: bool, color=(120, 
                 x = w - (x + bw)
             cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
             cv2.putText(frame, f"track: {detector}", (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        if isinstance(centroid, tuple) and len(centroid) == 2:
+            cx, cy = [int(v) for v in centroid]
+            if mirrored:
+                cx = w - cx
+            cv2.circle(frame, (cx, cy), 6, color, -1)
+    elif kind == "bike_mask":
+        bbox = debug.get("bbox")
+        pedal_zone = debug.get("pedal_zone")
+        centroid = debug.get("centroid")
+        if isinstance(pedal_zone, tuple) and len(pedal_zone) == 4:
+            x, y, bw, bh = [int(v) for v in pedal_zone]
+            if mirrored:
+                x = w - (x + bw)
+            cv2.rectangle(frame, (x, y), (x + bw, y + bh), (80, 80, 180), 2)
+            cv2.putText(frame, "pedal ignore", (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 180), 1, cv2.LINE_AA)
+        if isinstance(bbox, tuple) and len(bbox) == 4:
+            x, y, bw, bh = [int(v) for v in bbox]
+            if mirrored:
+                x = w - (x + bw)
+            cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
+            cv2.putText(frame, "track: bike torso", (x, max(20, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
         if isinstance(centroid, tuple) and len(centroid) == 2:
             cx, cy = [int(v) for v in centroid]
             if mirrored:
