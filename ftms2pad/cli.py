@@ -912,6 +912,17 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
         right_peak = _percentile(right_vals, 0.90) if right_vals else 0.7
         corrections: list[str] = []
         flip_sign = False
+        anchor_x_norm = None
+        anchor_y_norm = None
+        if anchors:
+            pts = list(anchors.values())
+            xs = sorted(p[0] for p in pts)
+            ys = sorted(p[1] for p in pts)
+            mx = xs[len(xs) // 2]
+            my = ys[len(ys) // 2]
+            # Debug frames are displayed at camera resolution for centroid/anchor math.
+            anchor_x_norm = mx / max(1.0, float(args.vision_width))
+            anchor_y_norm = my / max(1.0, float(args.vision_height))
 
         left_med = _percentile(left_vals, 0.50) if left_vals else neutral
         right_med = _percentile(right_vals, 0.50) if right_vals else neutral
@@ -946,7 +957,14 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
             right_peak = neutral + min_span
             corrections.append("right_span_min_applied")
 
-        calib = Calibrator(neutral=neutral, left_peak=left_peak, right_peak=right_peak, flip_sign=flip_sign)
+        calib = Calibrator(
+            neutral=neutral,
+            left_peak=left_peak,
+            right_peak=right_peak,
+            flip_sign=flip_sign,
+            anchor_x_norm=anchor_x_norm,
+            anchor_y_norm=anchor_y_norm,
+        )
         out = _calibration_path(args.profile)
         save_calibration(out, calib)
         print(f"Saved calibration: {out}")
@@ -955,7 +973,10 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
             print("Warning: low valid samples. Try more light, visible camera (0), or longer phase seconds.")
         if corrections:
             print(f"Calibration correction: {', '.join(corrections)}")
-        print(f"neutral={neutral:.4f} left_peak={left_peak:.4f} right_peak={right_peak:.4f} flip_sign={flip_sign}")
+        print(
+            f"neutral={neutral:.4f} left_peak={left_peak:.4f} right_peak={right_peak:.4f} "
+            f"flip_sign={flip_sign} anchor=({anchor_x_norm},{anchor_y_norm})"
+        )
         return 0
     finally:
         dbg.close()
@@ -1020,9 +1041,20 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
         resistance_target = float(getattr(args, "resistance_start", 0.0) or 0.0)
         resistance_step = max(0.1, float(getattr(args, "resistance_step", 1.0)))
         resistance_applied = False
+        pedal_ready = False
 
         while True:
             f = await ftms.next()
+            pedaling_now = _pedaling_started(
+                f,
+                float(getattr(args, "start_cadence_rpm", 20.0)),
+                float(getattr(args, "start_watts", 35.0)),
+            )
+            if pedaling_now and not pedal_ready:
+                pedal_ready = True
+                anchors.clear()
+                stand_active = False
+                vision.reset_tracking()
             if (
                 not resistance_applied
                 and resistance_target > 0.0
@@ -1038,8 +1070,18 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
             p, frame, debug = vision.next_with_frame()
             cam_key = _debug_camera_key(debug)
             anchor = anchors.get(cam_key)
-            if frame is not None:
+            if pedal_ready and frame is not None:
                 h, w = frame.shape[:2]
+                if (
+                    anchor is None
+                    and calib.anchor_x_norm is not None
+                    and calib.anchor_y_norm is not None
+                ):
+                    anchor = (
+                        int(max(0, min(w - 1, round(calib.anchor_x_norm * w)))),
+                        int(max(0, min(h - 1, round(calib.anchor_y_norm * h)))),
+                    )
+                    anchors[cam_key] = anchor
                 cent = _debug_centroid_px(debug, w, h, mirrored=mirror_preview)
                 if cent is not None and anchor is None:
                     anchors[cam_key] = cent
@@ -1052,7 +1094,7 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
                 frame.shape[0] if frame is not None else None,
                 mirrored=mirror_preview,
             )
-            pose_ok = p.confidence >= _pose_conf_threshold(p.source) and pass_anchor
+            pose_ok = pedal_ready and p.confidence >= _pose_conf_threshold(p.source) and pass_anchor
             steer = fusion.steer(p.steer_raw, pose_ok=pose_ok)
             throttle = fusion.throttle(f.watts, connected=f.connected)
 
@@ -1098,6 +1140,8 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
                     debug=debug,
                     anchor=anchor,
                 )
+                if not pedal_ready:
+                    cv2.putText(frame, "Start pedaling to lock center", (20, 114), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (60, 220, 255), 2, cv2.LINE_AA)
                 dbg.log(
                     p=p,
                     f=f,
@@ -1106,7 +1150,7 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
                     debug=debug,
                     anchor=anchor,
                     frame=frame,
-                    extra={"pose_ok": pose_ok, "pass_anchor": pass_anchor},
+                    extra={"pose_ok": pose_ok, "pass_anchor": pass_anchor, "pedal_ready": pedal_ready},
                 )
                 cv2.imshow(win, frame)
                 keycode = cv2.waitKey(1) & 0xFF
@@ -1133,7 +1177,7 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
                     throttle=throttle,
                     debug=debug,
                     anchor=anchor,
-                    extra={"pose_ok": pose_ok, "pass_anchor": pass_anchor},
+                    extra={"pose_ok": pose_ok, "pass_anchor": pass_anchor, "pedal_ready": pedal_ready},
                 )
             await asyncio.sleep(dt)
     except (KeyboardInterrupt, asyncio.CancelledError):

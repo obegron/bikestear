@@ -26,6 +26,8 @@ class Calibrator:
     left_peak: float = -0.7
     right_peak: float = 0.7
     flip_sign: bool = False
+    anchor_x_norm: float | None = None
+    anchor_y_norm: float | None = None
 
     def normalize(self, raw: float) -> float:
         if self.flip_sign:

@@ -16,6 +16,8 @@ def load_calibration(path: Path) -> Calibrator:
         left_peak=float(data.get("left_peak", -0.7)),
         right_peak=float(data.get("right_peak", 0.7)),
         flip_sign=bool(data.get("flip_sign", False)),
+        anchor_x_norm=float(data["anchor_x_norm"]) if data.get("anchor_x_norm") is not None else None,
+        anchor_y_norm=float(data["anchor_y_norm"]) if data.get("anchor_y_norm") is not None else None,
     )
 
 
