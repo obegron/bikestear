@@ -735,6 +735,7 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
         anchors: dict[str, tuple[int, int]] = {}
         anchor_samples: dict[str, list[tuple[int, int]]] = {}
         anchor_locked: set[str] = set()
+        anchor_frames: dict[str, tuple[int, int]] = {}
 
         def _anchor_from_samples(cam_key: str) -> tuple[int, int] | None:
             samples = anchor_samples.get(cam_key, [])
@@ -758,6 +759,7 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             continue
                         h, w = frame.shape[:2]
                         cam_key = _debug_camera_key(debug)
+                        anchor_frames[cam_key] = (w, h)
                         cent = _debug_centroid_px(debug, w, h, mirrored=not args.no_mirror)
                         conf_th = _pose_conf_threshold(p.source)
                         stable_for_anchor = (
@@ -832,6 +834,7 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                         if accept_sample:
                             buckets[key].append(p.steer_raw)
                         h, w = frame.shape[:2]
+                        anchor_frames[cam_key] = (w, h)
                         cent = _debug_centroid_px(debug, w, h, mirrored=not args.no_mirror)
                         stable_for_anchor = (
                             cent is not None
@@ -915,14 +918,16 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
         anchor_x_norm = None
         anchor_y_norm = None
         if anchors:
-            pts = list(anchors.values())
-            xs = sorted(p[0] for p in pts)
-            ys = sorted(p[1] for p in pts)
-            mx = xs[len(xs) // 2]
-            my = ys[len(ys) // 2]
-            # Debug frames are displayed at camera resolution for centroid/anchor math.
-            anchor_x_norm = mx / max(1.0, float(args.vision_width))
-            anchor_y_norm = my / max(1.0, float(args.vision_height))
+            norm_xs: list[float] = []
+            norm_ys: list[float] = []
+            for cam_key, (ax, ay) in anchors.items():
+                fw, fh = anchor_frames.get(cam_key, (args.vision_width, args.vision_height))
+                norm_xs.append(ax / max(1.0, float(fw)))
+                norm_ys.append(ay / max(1.0, float(fh)))
+            norm_xs.sort()
+            norm_ys.sort()
+            anchor_x_norm = norm_xs[len(norm_xs) // 2]
+            anchor_y_norm = norm_ys[len(norm_ys) // 2]
 
         left_med = _percentile(left_vals, 0.50) if left_vals else neutral
         right_med = _percentile(right_vals, 0.50) if right_vals else neutral
@@ -1025,6 +1030,8 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
         cv2 = None
         win = None
         anchors: dict[str, tuple[int, int]] = {}
+        anchor_relock_until: dict[str, float] = {}
+        anchor_relock_samples: dict[str, list[tuple[int, int]]] = {}
         if gui_enabled:
             try:
                 import cv2 as _cv2
@@ -1053,6 +1060,8 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
             if pedaling_now and not pedal_ready:
                 pedal_ready = True
                 anchors.clear()
+                anchor_relock_until.clear()
+                anchor_relock_samples.clear()
                 stand_active = False
                 vision.reset_tracking()
             if (
@@ -1082,10 +1091,35 @@ async def _run_loop(args: argparse.Namespace, monitor_only: bool) -> int:
                         int(max(0, min(h - 1, round(calib.anchor_y_norm * h)))),
                     )
                     anchors[cam_key] = anchor
+                    anchor_relock_until[cam_key] = monotonic() + 1.0
                 cent = _debug_centroid_px(debug, w, h, mirrored=mirror_preview)
+                if (
+                    cent is not None
+                    and anchor is not None
+                    and cam_key in anchor_relock_until
+                    and (abs(cent[0] - anchor[0]) > int(w * 0.22) or abs(cent[1] - anchor[1]) > int(h * 0.18))
+                ):
+                    anchor = cent
+                    anchors[cam_key] = anchor
                 if cent is not None and anchor is None:
                     anchors[cam_key] = cent
                     anchor = cent
+                elif cent is not None and anchor is not None and p.source == "camera-bike":
+                    relock_deadline = anchor_relock_until.get(cam_key, 0.0)
+                    if monotonic() < relock_deadline and p.confidence >= _pose_conf_threshold(p.source):
+                        samples = anchor_relock_samples.setdefault(cam_key, [])
+                        samples.append(cent)
+                        if len(samples) > 24:
+                            del samples[:-24]
+                    elif cam_key in anchor_relock_until:
+                        samples = anchor_relock_samples.get(cam_key, [])
+                        if samples:
+                            xs = sorted(p[0] for p in samples)
+                            ys = sorted(p[1] for p in samples)
+                            anchor = (xs[len(xs) // 2], ys[len(ys) // 2])
+                            anchors[cam_key] = anchor
+                        anchor_relock_until.pop(cam_key, None)
+                        anchor_relock_samples.pop(cam_key, None)
             pass_anchor = _anchor_gate_pass(
                 p.source,
                 debug,

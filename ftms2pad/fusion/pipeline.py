@@ -54,12 +54,16 @@ class FusionPipeline:
             return self._steer_prev
 
         steer = self.calibrator.normalize(steer_raw)
+        near_center = abs(steer) <= max(self.profile.steering.deadzone * 1.6, 0.12)
         if self.profile.steering.invert:
             steer *= -1.0
         steer *= self.profile.steering.gain
         steer = _clamp(steer)
         steer = _apply_deadzone(steer, self.profile.steering.deadzone)
-        self._steer_prev = _lpf(self._steer_prev, steer, self.profile.steering.smoothing)
+        alpha = self.profile.steering.smoothing
+        if near_center:
+            alpha = min(1.0, max(alpha, 0.28))
+        self._steer_prev = _lpf(self._steer_prev, steer, alpha)
         return self._steer_prev
 
     def throttle(self, watts: float, connected: bool = True) -> float:
