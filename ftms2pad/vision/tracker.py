@@ -294,7 +294,7 @@ class VisionTracker:
             if best_score is None or score > best_score:
                 best_score = score
                 best_area = area
-                best = (x, y, bw, bh, cx, cy)
+                best = (x, y, bw, bh, cx, cy, contour)
 
         # Slowly adapt background, excluding detected torso so the rider remains foreground.
         learn_mask = cv2.bitwise_not(mask)
@@ -315,7 +315,24 @@ class VisionTracker:
                 return max(-1.0, min(1.0, raw)), 0.18, debug
             return 0.0, 0.0, {"kind": "bike_mask", "miss": True}
 
-        x, y, bw, bh, cx, cy = best
+        x, y, bw, bh, cx, cy, contour = best
+        # Shoulder/arm motion can pull the full-contour centroid sideways.
+        # Recompute x from the lower torso slice so steering follows body mass better.
+        try:
+            contour_local = contour.copy()
+            contour_local[:, 0, 0] = contour_local[:, 0, 0] + roi_x0
+            contour_local[:, 0, 1] = contour_local[:, 0, 1] + roi_y0
+            local_mask = gray.copy()
+            local_mask[:] = 0
+            cv2.drawContours(local_mask, [contour_local], -1, 255, thickness=-1)
+            lower_y = int(y + bh * 0.42)
+            lower_mask = local_mask[lower_y : y + bh, x : x + bw]
+            if lower_mask.size > 0:
+                m2 = cv2.moments(lower_mask, binaryImage=True)
+                if abs(m2["m00"]) > 1e-5:
+                    cx = x + (float(m2["m10"]) / float(m2["m00"]))
+        except Exception:
+            pass
         if monotonic() < self._bike_warmup_until:
             return 0.0, 0.0, {
                 "kind": "bike_mask",

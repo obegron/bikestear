@@ -700,6 +700,7 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
         idle_hz=args.mux_idle_hz,
     )
     dbg = DebugLogger(args.debug_log, "calibrate", args.debug_fps, args.debug_width, args.debug_height)
+    ftms = FtmsSource(args.bike, verbose=getattr(args, "verbose", False))
     if dbg.enabled and dbg.session_dir is not None:
         print(f"debug log: {dbg.session_dir}")
     try:
@@ -745,14 +746,50 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
             ys = [p[1] for p in samples]
             return int(median(xs)), int(median(ys))
 
+        def _stable_for_anchor(p, debug: dict, cent) -> bool:
+            conf_th = _pose_conf_threshold(p.source)
+            return (
+                cent is not None
+                and p.confidence >= conf_th
+                and not bool(debug.get("warmup", False))
+                and not bool(debug.get("anchor_pending", False))
+                and not bool(debug.get("held", False))
+            )
+
+        def _accept_neutral_sample(p, debug: dict) -> bool:
+            conf_th = _pose_conf_threshold(p.source)
+            if p.source == "camera-bike":
+                return (
+                    p.confidence >= conf_th
+                    and not bool(debug.get("warmup", False))
+                    and not bool(debug.get("anchor_pending", False))
+                )
+            return p.confidence >= conf_th
+
+        def _accept_side_sample(p, debug: dict, anchor, frame) -> bool:
+            conf_th = _pose_conf_threshold(p.source)
+            return p.confidence >= conf_th and _anchor_gate_pass(
+                p.source, debug, anchor, frame.shape[1], frame.shape[0], mirrored=not args.no_mirror
+            )
+
+        def _resistance_phase(level: float, target: float, band: float) -> str:
+            if level < (target - band):
+                return "left"
+            if level > (target + band):
+                return "right"
+            return "neutral"
+
         if use_gui and cv2 is not None:
             try:
                 win = "ftms2pad calibrate"
                 cv2.namedWindow(win, cv2.WINDOW_NORMAL)
                 cv2.resizeWindow(win, 960, 540)
-                for title, key, hint in phases:
-                    prep_end = asyncio.get_running_loop().time() + prep_seconds
-                    while asyncio.get_running_loop().time() < prep_end:
+                if float(getattr(args, "resistance_calibration_level", 0.0) or 0.0) > 0.0:
+                    pedal_idle_started: float | None = None
+                    target_level = float(getattr(args, "resistance_calibration_level", 5.0))
+                    band = max(0.1, float(getattr(args, "resistance_calibration_band", 0.5)))
+                    while True:
+                        f = await ftms.next()
                         p, frame, debug = vision.next_with_frame()
                         if frame is None:
                             await asyncio.sleep(1 / 30)
@@ -761,89 +798,8 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                         cam_key = _debug_camera_key(debug)
                         anchor_frames[cam_key] = (w, h)
                         cent = _debug_centroid_px(debug, w, h, mirrored=not args.no_mirror)
-                        conf_th = _pose_conf_threshold(p.source)
-                        stable_for_anchor = (
-                            cent is not None
-                            and p.confidence >= conf_th
-                            and not bool(debug.get("warmup", False))
-                            and not bool(debug.get("anchor_pending", False))
-                            and not bool(debug.get("held", False))
-                        )
-                        if stable_for_anchor and key == "neutral" and cam_key not in anchor_locked:
-                            samples = anchor_samples.setdefault(cam_key, [])
-                            samples.append(cent)
-                            if len(samples) > 24:
-                                del samples[:-24]
-                            anchor = _anchor_from_samples(cam_key)
-                            if anchor is not None:
-                                anchors[cam_key] = anchor
-                        else:
-                            anchor = _anchor_from_samples(cam_key)
-                        display = frame.copy()
-                        _draw_calibration_frame(
-                            cv2,
-                            display,
-                            p,
-                            debug,
-                            f"GET READY: {title}",
-                            hint,
-                            prep_end - asyncio.get_running_loop().time(),
-                            mirror_preview=not args.no_mirror,
-                            collecting=False,
-                            anchor=anchor,
-                        )
-                        dbg.log(
-                            p=p,
-                            debug=debug,
-                            anchor=anchor,
-                            frame=display,
-                            extra={"phase": title, "phase_key": key, "state": "prep"},
-                        )
-                        cv2.imshow(win, display)
-                        keycode = cv2.waitKey(1) & 0xFF
-                        if keycode == ord("q"):
-                            print("Calibration canceled.")
-                            cv2.destroyWindow(win)
-                            return 1
-                        if keycode == ord("r"):
-                            anchors.clear()
-                            anchor_samples.clear()
-                            anchor_locked.clear()
-                            vision.reset_tracking()
-                        await asyncio.sleep(1 / 30)
-
-                    end_at = asyncio.get_running_loop().time() + phase_seconds
-                    while asyncio.get_running_loop().time() < end_at:
-                        p, frame, debug = vision.next_with_frame()
-                        if frame is None:
-                            await asyncio.sleep(1 / 30)
-                            continue
-                        cam_key = _debug_camera_key(debug)
                         anchor = _anchor_from_samples(cam_key)
-                        conf_th = _pose_conf_threshold(p.source)
-                        pass_anchor = _anchor_gate_pass(
-                            p.source, debug, anchor, frame.shape[1], frame.shape[0], mirrored=not args.no_mirror
-                        )
-                        accept_sample = p.confidence >= conf_th and pass_anchor
-                        if key == "neutral" and p.source == "camera-bike":
-                            accept_sample = (
-                                p.confidence >= conf_th
-                                and not bool(debug.get("warmup", False))
-                                and not bool(debug.get("anchor_pending", False))
-                            )
-                        if accept_sample:
-                            buckets[key].append(p.steer_raw)
-                        h, w = frame.shape[:2]
-                        anchor_frames[cam_key] = (w, h)
-                        cent = _debug_centroid_px(debug, w, h, mirrored=not args.no_mirror)
-                        stable_for_anchor = (
-                            cent is not None
-                            and p.confidence >= conf_th
-                            and not bool(debug.get("warmup", False))
-                            and not bool(debug.get("anchor_pending", False))
-                            and not bool(debug.get("held", False))
-                        )
-                        if stable_for_anchor and key == "neutral" and cam_key not in anchor_locked:
+                        if _stable_for_anchor(p, debug, cent):
                             samples = anchor_samples.setdefault(cam_key, [])
                             samples.append(cent)
                             if len(samples) > 24:
@@ -851,28 +807,85 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             anchor = _anchor_from_samples(cam_key)
                             if anchor is not None:
                                 anchors[cam_key] = anchor
-                            if len(samples) >= 8:
-                                anchor_locked.add(cam_key)
-
+                        phase_key = _resistance_phase(float(getattr(f, "resistance_level", 0.0)), target_level, band)
+                        accepted = False
+                        if phase_key == "neutral":
+                            if _accept_neutral_sample(p, debug):
+                                buckets["neutral"].append(p.steer_raw)
+                                accepted = True
+                        else:
+                            if _accept_side_sample(p, debug, anchor, frame):
+                                buckets[phase_key].append(p.steer_raw)
+                                accepted = True
+                        pedaling_now = _pedaling_started(
+                            f,
+                            float(getattr(args, "start_cadence_rpm", 20.0)),
+                            float(getattr(args, "start_watts", 35.0)),
+                        )
+                        ready_to_finish = bool(
+                            len(buckets["neutral"]) >= 40 and len(buckets["left"]) >= 30 and len(buckets["right"]) >= 30
+                        )
+                        if ready_to_finish and not pedaling_now:
+                            if pedal_idle_started is None:
+                                pedal_idle_started = monotonic()
+                        else:
+                            pedal_idle_started = None
+                        title = f"RESISTANCE CAL: {phase_key.upper()}"
+                        hint = (
+                            f"Set resistance < {target_level - band:0.1f}=LEFT, {target_level:0.1f}=CENTER, > {target_level + band:0.1f}=RIGHT"
+                        )
                         display = frame.copy()
                         _draw_calibration_frame(
                             cv2,
                             display,
                             p,
                             debug,
-                            f"COLLECT: {title}",
+                            title,
                             hint,
-                            end_at - asyncio.get_running_loop().time(),
+                            0.0,
                             mirror_preview=not args.no_mirror,
                             collecting=True,
                             anchor=anchor,
                         )
+                        cv2.putText(
+                            display,
+                            f"res={f.resistance_level:0.1f} target={target_level:0.1f}  samples center={len(buckets['neutral'])} left={len(buckets['left'])} right={len(buckets['right'])}",
+                            (20, 122),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.56,
+                            (235, 235, 235),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                        if ready_to_finish:
+                            status = "Stop pedaling to save"
+                            if pedal_idle_started is not None:
+                                remaining = max(0.0, 1.2 - (monotonic() - pedal_idle_started))
+                                status = f"Saving in {remaining:0.1f}s"
+                            cv2.putText(
+                                display,
+                                status,
+                                (20, 148),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.58,
+                                (255, 210, 80),
+                                1,
+                                cv2.LINE_AA,
+                            )
                         dbg.log(
                             p=p,
+                            f=f,
                             debug=debug,
                             anchor=anchor,
                             frame=display,
-                            extra={"phase": title, "phase_key": key, "state": "collect", "pass_anchor": pass_anchor, "accepted": accept_sample},
+                            extra={
+                                "state": "resistance_calibration",
+                                "phase_key": phase_key,
+                                "accepted": accepted,
+                                "ready_to_finish": ready_to_finish,
+                                "target_level": target_level,
+                                "band": band,
+                            },
                         )
                         cv2.imshow(win, display)
                         keycode = cv2.waitKey(1) & 0xFF
@@ -884,8 +897,259 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
                             anchors.clear()
                             anchor_samples.clear()
                             anchor_locked.clear()
+                            buckets = {"neutral": [], "left": [], "right": []}
+                            pedal_idle_started = None
                             vision.reset_tracking()
+                        if pedal_idle_started is not None and (monotonic() - pedal_idle_started) >= 1.2:
+                            cv2.destroyWindow(win)
+                            break
                         await asyncio.sleep(1 / 30)
+                elif getattr(args, "manual_calibration", False):
+                    active_key: str | None = None
+                    pedal_idle_started: float | None = None
+                    keycheck_stage = "minus"
+                    while True:
+                        p, frame, debug = vision.next_with_frame()
+                        if frame is None:
+                            await asyncio.sleep(1 / 30)
+                            continue
+                        h, w = frame.shape[:2]
+                        cam_key = _debug_camera_key(debug)
+                        anchor_frames[cam_key] = (w, h)
+                        cent = _debug_centroid_px(debug, w, h, mirrored=not args.no_mirror)
+                        anchor = _anchor_from_samples(cam_key)
+                        if active_key is None and _stable_for_anchor(p, debug, cent):
+                            samples = anchor_samples.setdefault(cam_key, [])
+                            samples.append(cent)
+                            if len(samples) > 24:
+                                del samples[:-24]
+                            anchor = _anchor_from_samples(cam_key)
+                            if anchor is not None:
+                                anchors[cam_key] = anchor
+                        accepted = False
+                        if active_key is None:
+                            if _accept_neutral_sample(p, debug):
+                                buckets["neutral"].append(p.steer_raw)
+                                accepted = True
+                        else:
+                            if _accept_side_sample(p, debug, anchor, frame):
+                                buckets[active_key].append(p.steer_raw)
+                                accepted = True
+
+                        title = "MANUAL CENTER" if active_key is None else f"CAPTURE {active_key.upper()}"
+                        if keycheck_stage == "minus":
+                            hint = "Key test: press -"
+                        elif keycheck_stage == "plus":
+                            hint = "Key test: press +"
+                        else:
+                            hint = (
+                                "Pedal straight. Press - for left capture, + for right capture. Stop pedaling to save"
+                                if active_key is None
+                                else f"Move through {active_key}. Press {'-' if active_key == 'left' else '+'} again to stop"
+                            )
+                        pedaling_now = _pedaling_started(
+                            await ftms.next(),
+                            float(getattr(args, "start_cadence_rpm", 20.0)),
+                            float(getattr(args, "start_watts", 35.0)),
+                        )
+                        ready_to_finish = bool(buckets["neutral"] and buckets["left"] and buckets["right"] and active_key is None)
+                        if ready_to_finish and not pedaling_now:
+                            if pedal_idle_started is None:
+                                pedal_idle_started = monotonic()
+                        else:
+                            pedal_idle_started = None
+                        display = frame.copy()
+                        _draw_calibration_frame(
+                            cv2,
+                            display,
+                            p,
+                            debug,
+                            title,
+                            hint,
+                            0.0,
+                            mirror_preview=not args.no_mirror,
+                            collecting=active_key is not None,
+                            anchor=anchor,
+                        )
+                        cv2.putText(
+                            display,
+                            f"samples center={len(buckets['neutral'])} left={len(buckets['left'])} right={len(buckets['right'])}",
+                            (20, 122),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.58,
+                            (235, 235, 235),
+                            1,
+                            cv2.LINE_AA,
+                        )
+                        if ready_to_finish and keycheck_stage == "done":
+                            status = "Stop pedaling to save"
+                            if pedal_idle_started is not None:
+                                remaining = max(0.0, 1.2 - (monotonic() - pedal_idle_started))
+                                status = f"Saving in {remaining:0.1f}s"
+                            cv2.putText(
+                                display,
+                                status,
+                                (20, 148),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.58,
+                                (255, 210, 80),
+                                1,
+                                cv2.LINE_AA,
+                            )
+                        dbg.log(
+                            p=p,
+                            debug=debug,
+                            anchor=anchor,
+                            frame=display,
+                            extra={"state": "manual", "active": active_key or "neutral", "accepted": accepted, "ready_to_finish": ready_to_finish, "pedaling": pedaling_now, "keycheck_stage": keycheck_stage},
+                        )
+                        cv2.imshow(win, display)
+                        keycode = cv2.waitKey(1) & 0xFF
+                        if keycode == ord("q"):
+                            print("Calibration canceled.")
+                            cv2.destroyWindow(win)
+                            return 1
+                        if keycode == ord("r"):
+                            anchors.clear()
+                            anchor_samples.clear()
+                            anchor_locked.clear()
+                            buckets = {"neutral": [], "left": [], "right": []}
+                            active_key = None
+                            pedal_idle_started = None
+                            keycheck_stage = "minus"
+                            vision.reset_tracking()
+                        if keycheck_stage == "minus":
+                            if keycode == ord("-"):
+                                keycheck_stage = "plus"
+                        elif keycheck_stage == "plus":
+                            if keycode in (ord("+"), ord("=")):
+                                keycheck_stage = "done"
+                        else:
+                            if keycode == ord("-"):
+                                active_key = None if active_key == "left" else "left"
+                            if keycode in (ord("+"), ord("=")):
+                                active_key = None if active_key == "right" else "right"
+                        if keycheck_stage == "done" and pedal_idle_started is not None and (monotonic() - pedal_idle_started) >= 1.2:
+                            cv2.destroyWindow(win)
+                            break
+                        await asyncio.sleep(1 / 30)
+                else:
+                    for title, key, hint in phases:
+                        prep_end = asyncio.get_running_loop().time() + prep_seconds
+                        while asyncio.get_running_loop().time() < prep_end:
+                            p, frame, debug = vision.next_with_frame()
+                            if frame is None:
+                                await asyncio.sleep(1 / 30)
+                                continue
+                            h, w = frame.shape[:2]
+                            cam_key = _debug_camera_key(debug)
+                            anchor_frames[cam_key] = (w, h)
+                            cent = _debug_centroid_px(debug, w, h, mirrored=not args.no_mirror)
+                            if _stable_for_anchor(p, debug, cent) and key == "neutral" and cam_key not in anchor_locked:
+                                samples = anchor_samples.setdefault(cam_key, [])
+                                samples.append(cent)
+                                if len(samples) > 24:
+                                    del samples[:-24]
+                                anchor = _anchor_from_samples(cam_key)
+                                if anchor is not None:
+                                    anchors[cam_key] = anchor
+                            else:
+                                anchor = _anchor_from_samples(cam_key)
+                            display = frame.copy()
+                            _draw_calibration_frame(
+                                cv2,
+                                display,
+                                p,
+                                debug,
+                                f"GET READY: {title}",
+                                hint,
+                                prep_end - asyncio.get_running_loop().time(),
+                                mirror_preview=not args.no_mirror,
+                                collecting=False,
+                                anchor=anchor,
+                            )
+                            dbg.log(
+                                p=p,
+                                debug=debug,
+                                anchor=anchor,
+                                frame=display,
+                                extra={"phase": title, "phase_key": key, "state": "prep"},
+                            )
+                            cv2.imshow(win, display)
+                            keycode = cv2.waitKey(1) & 0xFF
+                            if keycode == ord("q"):
+                                print("Calibration canceled.")
+                                cv2.destroyWindow(win)
+                                return 1
+                            if keycode == ord("r"):
+                                anchors.clear()
+                                anchor_samples.clear()
+                                anchor_locked.clear()
+                                vision.reset_tracking()
+                            await asyncio.sleep(1 / 30)
+
+                        end_at = asyncio.get_running_loop().time() + phase_seconds
+                        while asyncio.get_running_loop().time() < end_at:
+                            p, frame, debug = vision.next_with_frame()
+                            if frame is None:
+                                await asyncio.sleep(1 / 30)
+                                continue
+                            cam_key = _debug_camera_key(debug)
+                            anchor = _anchor_from_samples(cam_key)
+                            pass_anchor = _anchor_gate_pass(
+                                p.source, debug, anchor, frame.shape[1], frame.shape[0], mirrored=not args.no_mirror
+                            )
+                            accept_sample = _accept_side_sample(p, debug, anchor, frame)
+                            if key == "neutral":
+                                accept_sample = _accept_neutral_sample(p, debug)
+                            if accept_sample:
+                                buckets[key].append(p.steer_raw)
+                            h, w = frame.shape[:2]
+                            anchor_frames[cam_key] = (w, h)
+                            cent = _debug_centroid_px(debug, w, h, mirrored=not args.no_mirror)
+                            if _stable_for_anchor(p, debug, cent) and key == "neutral" and cam_key not in anchor_locked:
+                                samples = anchor_samples.setdefault(cam_key, [])
+                                samples.append(cent)
+                                if len(samples) > 24:
+                                    del samples[:-24]
+                                anchor = _anchor_from_samples(cam_key)
+                                if anchor is not None:
+                                    anchors[cam_key] = anchor
+                                if len(samples) >= 8:
+                                    anchor_locked.add(cam_key)
+
+                            display = frame.copy()
+                            _draw_calibration_frame(
+                                cv2,
+                                display,
+                                p,
+                                debug,
+                                f"COLLECT: {title}",
+                                hint,
+                                end_at - asyncio.get_running_loop().time(),
+                                mirror_preview=not args.no_mirror,
+                                collecting=True,
+                                anchor=anchor,
+                            )
+                            dbg.log(
+                                p=p,
+                                debug=debug,
+                                anchor=anchor,
+                                frame=display,
+                                extra={"phase": title, "phase_key": key, "state": "collect", "pass_anchor": pass_anchor, "accepted": accept_sample},
+                            )
+                            cv2.imshow(win, display)
+                            keycode = cv2.waitKey(1) & 0xFF
+                            if keycode == ord("q"):
+                                print("Calibration canceled.")
+                                cv2.destroyWindow(win)
+                                return 1
+                            if keycode == ord("r"):
+                                anchors.clear()
+                                anchor_samples.clear()
+                                anchor_locked.clear()
+                                vision.reset_tracking()
+                            await asyncio.sleep(1 / 30)
                 cv2.destroyWindow(win)
             except Exception:
                 use_gui = False
@@ -984,6 +1248,7 @@ async def cmd_calibrate(args: argparse.Namespace) -> int:
         )
         return 0
     finally:
+        await ftms.close()
         dbg.close()
         vision.close()
 
@@ -1280,6 +1545,9 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("calibrate", parents=[common], help="Capture neutral and lean range")
     c.add_argument("--no-gui", action="store_true", help="Use text-only calibration")
     c.add_argument("--no-mirror", action="store_true", help="Do not mirror preview window")
+    c.add_argument("--manual-calibration", action="store_true", help="Use manual toggle capture: '-' left, '+' right, 's' save")
+    c.add_argument("--resistance-calibration-level", type=float, default=0.0, help="Use trainer resistance as calibration selector; target level is center")
+    c.add_argument("--resistance-calibration-band", type=float, default=0.5, help="Center band around resistance calibration level")
     c.add_argument("--no-wait-pedal", action="store_true", help="Start calibration immediately instead of waiting for pedaling")
     c.add_argument("--start-cadence-rpm", type=float, default=20.0, help="cadence that starts calibration")
     c.add_argument("--start-watts", type=float, default=35.0, help="power that starts calibration")
