@@ -8,29 +8,13 @@ from pathlib import Path
 from ftms2pad.calibration import load_calibration
 from ftms2pad.fusion import FusionPipeline
 from ftms2pad.profiles import load_profile
+from ftms2pad.tracking import percentile as _percentile
+from ftms2pad.tracking import pose_conf_threshold as _pose_conf_threshold
 from ftms2pad.uinput import VirtualGamepad
 
 
 def _calibration_path(profile: str) -> Path:
     return Path("profiles") / f"{profile}.calibration.json"
-
-
-def _pose_conf_threshold(source: str) -> float:
-    if source == "camera-face":
-        return 0.18
-    if source == "camera-bike":
-        return 0.16
-    if source in ("camera-hog", "camera-blob"):
-        return 0.1
-    return 0.3
-
-
-def _percentile(values: list[float], p: float) -> float:
-    if not values:
-        return 0.0
-    vals = sorted(values)
-    idx = int((len(vals) - 1) * p)
-    return vals[max(0, min(len(vals) - 1, idx))]
 
 
 def _session_events_path(session: str) -> Path:

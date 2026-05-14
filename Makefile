@@ -33,4 +33,4 @@ calibrate:
 	uv run ftms2pad calibrate --profile $(PROFILE) --camera $(CAMERA) --bike $(BIKE) $(VISION_ARGS) $(CALIBRATE_ARGS) $(DEBUG_ARGS)
 
 test:
-	uv run python -m unittest -v tests/test_ftms_parser.py
+	uv run python -m unittest -v tests/test_ftms_parser.py tests/test_tracking.py
