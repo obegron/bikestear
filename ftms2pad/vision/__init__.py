@@ -1,16 +1,13 @@
-from __future__ import annotations
+from .tracker import TorsoEstimate, VisionPacket, VisionTracker, camera_name, estimate_torso, list_cameras
+from .worker import LatestVisionPacket, VisionWorker
 
-try:
-    from .tracker import VisionTracker, camera_name, list_cameras
-except ModuleNotFoundError as exc:  # pragma: no cover
-    _import_error = exc
-
-    def list_cameras(*args, **kwargs):
-        raise RuntimeError("Vision dependencies missing. Install opencv-python and mediapipe.") from _import_error
-
-    def camera_name(*args, **kwargs):
-        raise RuntimeError("Vision dependencies missing. Install opencv-python and mediapipe.") from _import_error
-
-    class VisionTracker:  # type: ignore[no-redef]
-        def __init__(self, *args, **kwargs):
-            raise RuntimeError("Vision dependencies missing. Install opencv-python and mediapipe.") from _import_error
+__all__ = [
+    "LatestVisionPacket",
+    "TorsoEstimate",
+    "VisionPacket",
+    "VisionTracker",
+    "VisionWorker",
+    "camera_name",
+    "estimate_torso",
+    "list_cameras",
+]
