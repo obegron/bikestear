@@ -4,15 +4,16 @@ from dataclasses import dataclass
 from time import monotonic
 
 
-@dataclass(slots=True)
-class PoseSample:
-    steer_raw: float
-    confidence: float
-    source: str
+@dataclass(frozen=True, slots=True)
+class VisionResult:
     ts: float
+    torso_x: float | None
+    confidence: float
+    actual_fps: float = 0.0
+    inference_ms: float = 0.0
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class FtmsSample:
     watts: float
     cadence_rpm: float
@@ -32,6 +33,4 @@ class FtmsSample:
             resistance_level=0.0,
             connected=False,
             ts=monotonic(),
-            raw_hex="",
-            control_point_hex="",
         )
