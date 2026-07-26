@@ -11,6 +11,9 @@ class VisionResult:
     confidence: float
     actual_fps: float = 0.0
     inference_ms: float = 0.0
+    gesture_candidate: bool = False
+    gesture_confidence: float = 0.0
+    gesture_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

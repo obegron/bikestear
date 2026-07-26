@@ -7,7 +7,7 @@ from time import monotonic
 
 from ftms2pad.calibration import XCalibration
 from ftms2pad.ftms import FtmsSource
-from ftms2pad.mapping import AxisValue, XAxisMapper, YAxisMapper
+from ftms2pad.mapping import AxisValue, GestureMapper, GestureValue, XAxisMapper, YAxisMapper
 from ftms2pad.profiles import Profile, VisionConfig
 from ftms2pad.types import FtmsSample
 from ftms2pad.uinput import VirtualGamepad
@@ -20,6 +20,7 @@ class RuntimeState:
     vision: VisionPacket | None = None
     x: AxisValue = AxisValue(raw=None, mapped=0.0, stale=True)
     y: AxisValue = AxisValue(raw=0.0, mapped=0.0)
+    gesture: GestureValue = GestureValue()
 
 
 def selected_vision_config(profile: Profile, camera: int | None) -> VisionConfig:
@@ -41,12 +42,14 @@ def _advance_mappers(
     state: RuntimeState,
     x_mapper: XAxisMapper,
     y_mapper: YAxisMapper,
+    gesture_mapper: GestureMapper,
     packet: VisionPacket | None,
     now: float,
 ) -> None:
     state.vision = packet
     state.x = x_mapper.update(packet.result if packet is not None else None, now)
     state.y = y_mapper.update(state.ftms)
+    state.gesture = gesture_mapper.update(packet.result if packet is not None else None, now)
 
 
 def _status_line(state: RuntimeState, source: str, now: float) -> str:
@@ -55,9 +58,19 @@ def _status_line(state: RuntimeState, source: str, now: float) -> str:
     age_ms = (now - result.ts) * 1000.0 if result is not None else inf
     raw_x = "  n/a" if state.x.raw is None else f"{state.x.raw:+.3f}"
     raw_y = float(state.y.raw or 0.0)
+    if not state.gesture.enabled:
+        gesture = "off"
+    elif state.gesture.stale:
+        gesture = "stale"
+    elif state.gesture.active:
+        gesture = "PRESSED"
+    elif state.gesture.candidate:
+        gesture = f"hold {state.gesture.held_ms:.0f}ms"
+    else:
+        gesture = "ready"
     return (
         f"vision conf={confidence:.2f} age={age_ms:5.0f}ms raw_x={raw_x} x={state.x.mapped:+.3f} "
-        f"{source}={raw_y:6.1f} y={state.y.mapped:.3f}"
+        f"{source}={raw_y:6.1f} y={state.y.mapped:.3f} gesture={gesture}"
     )
 
 
@@ -78,7 +91,12 @@ async def run_controller(
     state = RuntimeState(ftms=FtmsSample.disconnected())
     x_mapper = XAxisMapper(profile.x_axis, vision_config, calibration)
     y_mapper = YAxisMapper(profile.y_axis)
-    gamepad = None if dry_run else VirtualGamepad(profile.uinput.x_axis, profile.uinput.y_axis)
+    gesture_mapper = GestureMapper(vision_config)
+    gamepad = None if dry_run else VirtualGamepad(
+        profile.uinput.x_axis,
+        profile.uinput.y_axis,
+        profile.uinput.accept_button,
+    )
     if gamepad is not None and not gamepad.enabled:
         raise RuntimeError(f"Could not create virtual gamepad ({gamepad.error}). Check /dev/uinput permissions.")
 
@@ -94,9 +112,9 @@ async def run_controller(
         while duration_seconds <= 0.0 or monotonic() - started < duration_seconds:
             now = monotonic()
             packet, _ = worker.latest()
-            _advance_mappers(state, x_mapper, y_mapper, packet, now)
+            _advance_mappers(state, x_mapper, y_mapper, gesture_mapper, packet, now)
             if gamepad is not None:
-                gamepad.emit(state.x.mapped, state.y.mapped)
+                gamepad.emit(state.x.mapped, state.y.mapped, state.gesture.active)
             if worker.error is not None and not warned_vision:
                 print(f"\nVision worker stopped: {worker.error}. X will return to neutral; Y remains active.")
                 warned_vision = True
@@ -126,12 +144,13 @@ def draw_monitor_frame(frame, state: RuntimeState, source: str, now: float, mirr
 
     display = cv2.flip(frame, 1) if mirror else frame.copy()
     height, width = display.shape[:2]
+
+    def point(value: tuple[float, float]) -> tuple[int, int]:
+        x = 1.0 - value[0] if mirror else value[0]
+        return int(x * width), int(value[1] * height)
+
     torso = state.vision.torso if state.vision is not None else None
     if torso is not None:
-        def point(value: tuple[float, float]) -> tuple[int, int]:
-            x = 1.0 - value[0] if mirror else value[0]
-            return int(x * width), int(value[1] * height)
-
         shoulders = tuple(point(value) for value in torso.shoulders)
         cv2.line(display, shoulders[0], shoulders[1], (70, 220, 120), 2)
         for value in shoulders:
@@ -141,6 +160,12 @@ def draw_monitor_frame(frame, state: RuntimeState, source: str, now: float, mirr
             cv2.line(display, hips[0], hips[1], (80, 190, 255), 2)
             for value in hips:
                 cv2.circle(display, value, 4, (80, 190, 255), -1)
+    gesture_estimate = state.vision.gesture if state.vision is not None else None
+    if gesture_estimate is not None:
+        for wrist_value in gesture_estimate.wrists:
+            wrist = point(wrist_value)
+            wrist_color = (90, 255, 120) if gesture_estimate.candidate else (180, 180, 90)
+            cv2.circle(display, wrist, 6, wrist_color, 2)
 
     result = state.vision.result if state.vision is not None else None
     confidence = result.confidence if result is not None else 0.0
@@ -148,11 +173,23 @@ def draw_monitor_frame(frame, state: RuntimeState, source: str, now: float, mirr
     fps = result.actual_fps if result is not None else 0.0
     inference_ms = result.inference_ms if result is not None else 0.0
     raw_x = "n/a" if state.x.raw is None else f"{state.x.raw:+.3f}"
+    gesture_ms = result.gesture_ms if result is not None else 0.0
+    if not state.gesture.enabled:
+        gesture_text = "disabled"
+    elif state.gesture.stale:
+        gesture_text = "stale / released"
+    elif state.gesture.active:
+        gesture_text = "BTN_SOUTH pressed"
+    elif state.gesture.candidate:
+        gesture_text = f"holding {state.gesture.held_ms:.0f} ms"
+    else:
+        gesture_text = "ready"
     lines = (
         f"torso confidence {confidence:.2f}   age {age_ms:.0f} ms",
         f"X raw {raw_x}   mapped {state.x.mapped:+.3f}",
         f"Y {source} raw {float(state.y.raw or 0.0):.1f}   mapped {state.y.mapped:.3f}",
         f"vision {fps:.1f} FPS   inference {inference_ms:.1f} ms",
+        f"gesture {gesture_text}   classify {gesture_ms:.3f} ms",
     )
     for index, line in enumerate(lines):
         y = 28 + index * 26
@@ -178,6 +215,7 @@ async def monitor_controller(
     state = RuntimeState(ftms=FtmsSample.disconnected())
     x_mapper = XAxisMapper(profile.x_axis, vision_config, calibration)
     y_mapper = YAxisMapper(profile.y_axis)
+    gesture_mapper = GestureMapper(vision_config)
     ftms_task: asyncio.Task[None] | None = None
     cv2 = None
     window = "ftms2pad monitor"
@@ -199,7 +237,7 @@ async def monitor_controller(
         while True:
             now = monotonic()
             packet, generation = worker.latest()
-            _advance_mappers(state, x_mapper, y_mapper, packet, now)
+            _advance_mappers(state, x_mapper, y_mapper, gesture_mapper, packet, now)
             if worker.error is not None and not warned_vision:
                 print(f"\nVision worker stopped: {worker.error}. X will return to neutral; Y remains active.")
                 warned_vision = True

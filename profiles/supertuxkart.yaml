@@ -6,6 +6,10 @@ vision:
   height: 180
   fps: 20
   min_confidence: 0.5
+  gesture: disabled
+  gesture_hold_ms: 400
+  gesture_raise_margin: 0.08
+  gesture_stale_after_ms: 250
 
 x_axis:
   gain: 1.4
@@ -26,3 +30,4 @@ y_axis:
 uinput:
   x_axis: ABS_X
   y_axis: ABS_Y
+  accept_button: BTN_SOUTH

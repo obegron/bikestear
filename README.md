@@ -4,6 +4,7 @@
 
 - X follows horizontal torso position relative to a neutral calibration.
 - Y follows `speed_kph`, `watts`, or `cadence_rpm` from the bike.
+- An optional held wrist raise emits `BTN_SOUTH` for hands-free game actions.
 - The controller output loop runs at 60 Hz by default.
 
 Vision uses only MediaPipe shoulder and hip pose landmarks. It does not detect or track the head or face.
@@ -54,6 +55,10 @@ vision:
   height: 180
   fps: 20
   min_confidence: 0.5
+  gesture: disabled             # disabled or wrist_raise
+  gesture_hold_ms: 400
+  gesture_raise_margin: 0.08
+  gesture_stale_after_ms: 250
 
 x_axis:
   gain: 1.4
@@ -74,6 +79,7 @@ y_axis:
 uinput:
   x_axis: ABS_X
   y_axis: ABS_Y
+  accept_button: BTN_SOUTH
 ```
 
 X is a signed value from -1 to 1. Y is normalized and clamped from 0 to 1 before it is emitted across the configured signed Linux axis. `invert` reverses the corresponding mapped direction.
@@ -110,7 +116,9 @@ uv run ftms2pad monitor --profile supertuxkart --bike sim
 uv run ftms2pad monitor --profile supertuxkart --bike '<BLE address or name>'
 ```
 
-Monitor reports torso confidence and sample age, raw and mapped X, the selected raw and mapped FTMS Y value, actual vision FPS, and inference time. Press `q` in the preview to exit. Add `--no-preview` for terminal-only monitoring.
+Monitor reports torso confidence and sample age, raw and mapped X, the selected raw and mapped FTMS Y value, actual vision FPS and inference time, plus gesture candidate/hold/button state and classifier cost. Press `q` in the preview to exit. Add `--no-preview` for terminal-only monitoring.
+
+For a hands-free accept button, set `vision.gesture: wrist_raise`. Raise either wrist at least `gesture_raise_margin` above its matching shoulder and hold it for `gesture_hold_ms`. The button releases immediately when the wrist drops, confidence is lost, or the sample exceeds `gesture_stale_after_ms`. Tune this against a real riding session before depending on it; `disabled` is the safe default.
 
 ## Run
 
@@ -130,7 +138,7 @@ Press Ctrl+C to stop. The FTMS task is cancelled, the vision worker releases its
 
 ## Performance model
 
-Camera capture and MediaPipe inference run together in a dedicated worker thread. That worker overwrites one latest-result slot; frames never accumulate in a queue. MediaPipe uses its lightest pose model (`model_complexity=0`) in tracking mode on the CPU.
+Camera capture and MediaPipe inference run together in a dedicated worker thread. That worker overwrites one latest-result slot; frames never accumulate in a queue. MediaPipe uses its lightest pose model (`model_complexity=0`) in tracking mode on the CPU. Wrist raise reuses landmarks from that same Pose result and does not run a second model.
 
 Vision intentionally runs slower than the 60 Hz gamepad loop. The output loop reuses the newest vision and FTMS samples without waiting for a camera frame. When vision becomes stale or loses the torso, X smoothly returns toward neutral while bike-driven Y continues to update.
 
