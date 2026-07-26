@@ -2,7 +2,7 @@ from time import monotonic
 import unittest
 
 from ftms2pad.calibration import XCalibration
-from ftms2pad.mapping import XAxisMapper, YAxisMapper
+from ftms2pad.mapping import GestureMapper, XAxisMapper, YAxisMapper
 from ftms2pad.profiles import VisionConfig, XAxisConfig, YAxisConfig
 from ftms2pad.types import FtmsSample, VisionResult
 
@@ -82,6 +82,48 @@ class YAxisTests(unittest.TestCase):
     def test_inversion(self):
         mapper = YAxisMapper(YAxisConfig(source="watts", min=0, max=100, deadzone=0, smoothing=1, invert=True))
         self.assertAlmostEqual(mapper.update(ftms(watts=20)).mapped, 0.8)
+
+
+class GestureMapperTests(unittest.TestCase):
+    def mapper(self) -> GestureMapper:
+        return GestureMapper(VisionConfig(
+            min_confidence=0.5,
+            gesture="wrist_raise",
+            gesture_hold_ms=400,
+            gesture_stale_after_ms=250,
+        ))
+
+    def sample(self, ts: float, candidate: bool = True, confidence: float = 0.9) -> VisionResult:
+        return VisionResult(
+            ts=ts,
+            torso_x=0.0,
+            confidence=1.0,
+            gesture_candidate=candidate,
+            gesture_confidence=confidence,
+        )
+
+    def test_requires_configured_hold_before_pressing(self):
+        mapper = self.mapper()
+        self.assertFalse(mapper.update(self.sample(0.0), 0.0).active)
+        waiting = mapper.update(self.sample(0.35), 0.35)
+        self.assertFalse(waiting.active)
+        self.assertAlmostEqual(waiting.held_ms, 350.0)
+        self.assertTrue(mapper.update(self.sample(0.4), 0.4).active)
+
+    def test_release_resets_hold_before_reacquiring(self):
+        mapper = self.mapper()
+        mapper.update(self.sample(0.0), 0.0)
+        self.assertTrue(mapper.update(self.sample(0.4), 0.4).active)
+        self.assertFalse(mapper.update(self.sample(0.41, candidate=False), 0.41).active)
+        self.assertFalse(mapper.update(self.sample(0.42), 0.42).active)
+
+    def test_stale_tracking_releases_button(self):
+        mapper = self.mapper()
+        mapper.update(self.sample(0.0), 0.0)
+        self.assertTrue(mapper.update(self.sample(0.4), 0.4).active)
+        stale = mapper.update(self.sample(0.4), 0.7)
+        self.assertTrue(stale.stale)
+        self.assertFalse(stale.active)
 
 
 if __name__ == "__main__":

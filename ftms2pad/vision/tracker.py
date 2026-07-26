@@ -14,6 +14,8 @@ from ftms2pad.types import VisionResult
 
 LEFT_SHOULDER = 11
 RIGHT_SHOULDER = 12
+LEFT_WRIST = 15
+RIGHT_WRIST = 16
 LEFT_HIP = 23
 RIGHT_HIP = 24
 
@@ -33,10 +35,18 @@ class TorsoEstimate:
 
 
 @dataclass(frozen=True, slots=True)
+class WristGestureEstimate:
+    candidate: bool
+    confidence: float
+    wrists: tuple[tuple[float, float], tuple[float, float]]
+
+
+@dataclass(frozen=True, slots=True)
 class VisionPacket:
     result: VisionResult
     frame: Any = None
     torso: TorsoEstimate | None = None
+    gesture: WristGestureEstimate | None = None
 
 
 def _confidence(landmark: Landmark) -> float:
@@ -79,6 +89,45 @@ def estimate_torso(landmarks: Sequence[Landmark], min_confidence: float = 0.5) -
             (float(right_shoulder.x), float(right_shoulder.y)),
         ),
         hips=hips,
+    )
+
+
+def estimate_wrist_raise(
+    landmarks: Sequence[Landmark],
+    min_confidence: float = 0.5,
+    raise_margin: float = 0.08,
+) -> WristGestureEstimate | None:
+    """Recognize either wrist held clearly above its matching shoulder.
+
+    MediaPipe Pose already computes these landmarks for torso steering, so this
+    classifier adds no model or image-processing pass. Comparing each wrist to
+    its shoulder also keeps ordinary torso lean from becoming an accept action.
+    """
+    if len(landmarks) <= RIGHT_WRIST:
+        return None
+    left_shoulder = landmarks[LEFT_SHOULDER]
+    right_shoulder = landmarks[RIGHT_SHOULDER]
+    left_wrist = landmarks[LEFT_WRIST]
+    right_wrist = landmarks[RIGHT_WRIST]
+    pairs = ((left_wrist, left_shoulder), (right_wrist, right_shoulder))
+    reliable_confidences: list[float] = []
+    raised_confidences: list[float] = []
+    for wrist, shoulder in pairs:
+        confidence = min(_confidence(wrist), _confidence(shoulder))
+        if confidence < min_confidence:
+            continue
+        reliable_confidences.append(confidence)
+        if float(wrist.y) <= float(shoulder.y) - raise_margin:
+            raised_confidences.append(confidence)
+    if not reliable_confidences:
+        return None
+    return WristGestureEstimate(
+        candidate=bool(raised_confidences),
+        confidence=max(raised_confidences or reliable_confidences),
+        wrists=(
+            (float(left_wrist.x), float(left_wrist.y)),
+            (float(right_wrist.x), float(right_wrist.y)),
+        ),
     )
 
 
@@ -189,16 +238,30 @@ class VisionTracker:
         self._last_result_at = captured_at
 
         torso = None
+        gesture = None
+        gesture_ms = 0.0
         if processed.pose_landmarks is not None:
-            torso = estimate_torso(processed.pose_landmarks.landmark, self.config.min_confidence)
+            landmarks = processed.pose_landmarks.landmark
+            torso = estimate_torso(landmarks, self.config.min_confidence)
+            if self.config.gesture == "wrist_raise":
+                gesture_started = monotonic()
+                gesture = estimate_wrist_raise(
+                    landmarks,
+                    self.config.min_confidence,
+                    self.config.gesture_raise_margin,
+                )
+                gesture_ms = (monotonic() - gesture_started) * 1000.0
         result = VisionResult(
             ts=captured_at,
             torso_x=torso.torso_x if torso is not None else None,
             confidence=torso.confidence if torso is not None else 0.0,
             actual_fps=self._actual_fps,
             inference_ms=inference_ms,
+            gesture_candidate=gesture.candidate if gesture is not None else False,
+            gesture_confidence=gesture.confidence if gesture is not None else 0.0,
+            gesture_ms=gesture_ms,
         )
-        return VisionPacket(result=result, frame=frame, torso=torso)
+        return VisionPacket(result=result, frame=frame, torso=torso, gesture=gesture)
 
     def close(self) -> None:
         if self._closed:

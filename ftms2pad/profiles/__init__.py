@@ -1,4 +1,5 @@
 from .loader import (
+    GESTURES,
     Y_SOURCES,
     Profile,
     UInputConfig,
@@ -10,6 +11,7 @@ from .loader import (
 )
 
 __all__ = [
+    "GESTURES",
     "Y_SOURCES",
     "Profile",
     "UInputConfig",

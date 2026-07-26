@@ -28,6 +28,45 @@ class AxisValue:
     stale: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class GestureValue:
+    enabled: bool = False
+    candidate: bool = False
+    active: bool = False
+    held_ms: float = 0.0
+    stale: bool = False
+
+
+class GestureMapper:
+    def __init__(self, config: VisionConfig) -> None:
+        self.config = config
+        self._candidate_since: float | None = None
+
+    def update(self, sample: VisionResult | None, now: float) -> GestureValue:
+        if self.config.gesture == "disabled":
+            self._candidate_since = None
+            return GestureValue(enabled=False)
+        fresh = (
+            sample is not None
+            and (now - sample.ts) * 1000.0 <= self.config.gesture_stale_after_ms
+            and sample.gesture_confidence >= self.config.min_confidence
+        )
+        candidate = bool(fresh and sample is not None and sample.gesture_candidate)
+        if not candidate:
+            self._candidate_since = None
+            return GestureValue(enabled=True, stale=not fresh)
+        if self._candidate_since is None:
+            self._candidate_since = now
+        held_ms = max(0.0, (now - self._candidate_since) * 1000.0)
+        return GestureValue(
+            enabled=True,
+            candidate=True,
+            active=held_ms >= self.config.gesture_hold_ms,
+            held_ms=held_ms,
+            stale=False,
+        )
+
+
 class XAxisMapper:
     def __init__(self, config: XAxisConfig, vision: VisionConfig, calibration: XCalibration) -> None:
         self.config = config

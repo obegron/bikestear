@@ -8,6 +8,7 @@ from typing import Any, TypeVar
 import yaml
 
 Y_SOURCES = frozenset({"speed_kph", "watts", "cadence_rpm"})
+GESTURES = frozenset({"disabled", "wrist_raise"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +18,10 @@ class VisionConfig:
     height: int = 180
     fps: float = 20.0
     min_confidence: float = 0.5
+    gesture: str = "disabled"
+    gesture_hold_ms: float = 400.0
+    gesture_raise_margin: float = 0.08
+    gesture_stale_after_ms: float = 250.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +48,7 @@ class YAxisConfig:
 class UInputConfig:
     x_axis: str = "ABS_X"
     y_axis: str = "ABS_Y"
+    accept_button: str = "BTN_SOUTH"
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +114,15 @@ def _validate(profile: Profile) -> None:
         raise ValueError("vision.fps must be between 1 and 60")
     if not 0.0 < number(vision.min_confidence, "vision.min_confidence") <= 1.0:
         raise ValueError("vision.min_confidence must be greater than 0 and at most 1")
+    if vision.gesture not in GESTURES:
+        choices = ", ".join(sorted(GESTURES))
+        raise ValueError(f"Unknown vision.gesture '{vision.gesture}'; choose one of: {choices}")
+    if number(vision.gesture_hold_ms, "vision.gesture_hold_ms") < 0.0:
+        raise ValueError("vision.gesture_hold_ms must be at least 0")
+    if not 0.0 < number(vision.gesture_raise_margin, "vision.gesture_raise_margin") < 0.5:
+        raise ValueError("vision.gesture_raise_margin must be greater than 0 and less than 0.5")
+    if number(vision.gesture_stale_after_ms, "vision.gesture_stale_after_ms") <= 0.0:
+        raise ValueError("vision.gesture_stale_after_ms must be greater than 0")
 
     x_axis = profile.x_axis
     if number(x_axis.gain, "x_axis.gain") <= 0.0:
@@ -144,6 +159,8 @@ def _validate(profile: Profile) -> None:
             raise ValueError(f"uinput.{field_name} must be a Linux ABS_* axis name")
     if profile.uinput.x_axis == profile.uinput.y_axis:
         raise ValueError("uinput.x_axis and uinput.y_axis must be different")
+    if not isinstance(profile.uinput.accept_button, str) or not profile.uinput.accept_button.startswith("BTN_"):
+        raise ValueError("uinput.accept_button must be a Linux BTN_* button name")
 
 
 def load_profile(profile: str, search_dir: Path | None = None) -> Profile:
