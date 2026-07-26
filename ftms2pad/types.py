@@ -12,6 +12,8 @@ class VisionResult:
     actual_fps: float = 0.0
     inference_ms: float = 0.0
     gesture_candidate: bool = False
+    gesture_left_raised: bool = False
+    gesture_right_raised: bool = False
     gesture_confidence: float = 0.0
     gesture_ms: float = 0.0
 

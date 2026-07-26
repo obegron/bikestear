@@ -62,6 +62,8 @@ class TorsoEstimateTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertTrue(result.candidate)
+        self.assertTrue(result.left_raised)
+        self.assertFalse(result.right_raised)
         self.assertAlmostEqual(result.confidence, 0.85)
 
     def test_wrist_raise_rejects_handlebar_position_and_unreliable_wrists(self):
@@ -75,6 +77,8 @@ class TorsoEstimateTests(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertFalse(result.candidate)
+        self.assertFalse(result.left_raised)
+        self.assertFalse(result.right_raised)
 
 
 if __name__ == "__main__":

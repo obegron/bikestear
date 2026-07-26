@@ -36,9 +36,14 @@ class TorsoEstimate:
 
 @dataclass(frozen=True, slots=True)
 class WristGestureEstimate:
-    candidate: bool
+    left_raised: bool
+    right_raised: bool
     confidence: float
     wrists: tuple[tuple[float, float], tuple[float, float]]
+
+    @property
+    def candidate(self) -> bool:
+        return self.left_raised or self.right_raised
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,20 +114,27 @@ def estimate_wrist_raise(
     right_shoulder = landmarks[RIGHT_SHOULDER]
     left_wrist = landmarks[LEFT_WRIST]
     right_wrist = landmarks[RIGHT_WRIST]
-    pairs = ((left_wrist, left_shoulder), (right_wrist, right_shoulder))
-    reliable_confidences: list[float] = []
-    raised_confidences: list[float] = []
-    for wrist, shoulder in pairs:
-        confidence = min(_confidence(wrist), _confidence(shoulder))
-        if confidence < min_confidence:
-            continue
-        reliable_confidences.append(confidence)
-        if float(wrist.y) <= float(shoulder.y) - raise_margin:
-            raised_confidences.append(confidence)
+    left_confidence = min(_confidence(left_wrist), _confidence(left_shoulder))
+    right_confidence = min(_confidence(right_wrist), _confidence(right_shoulder))
+    left_reliable = left_confidence >= min_confidence
+    right_reliable = right_confidence >= min_confidence
+    reliable_confidences = [
+        confidence
+        for confidence, reliable in ((left_confidence, left_reliable), (right_confidence, right_reliable))
+        if reliable
+    ]
     if not reliable_confidences:
         return None
+    left_raised = left_reliable and float(left_wrist.y) <= float(left_shoulder.y) - raise_margin
+    right_raised = right_reliable and float(right_wrist.y) <= float(right_shoulder.y) - raise_margin
+    raised_confidences = [
+        confidence
+        for confidence, raised in ((left_confidence, left_raised), (right_confidence, right_raised))
+        if raised
+    ]
     return WristGestureEstimate(
-        candidate=bool(raised_confidences),
+        left_raised=left_raised,
+        right_raised=right_raised,
         confidence=max(raised_confidences or reliable_confidences),
         wrists=(
             (float(left_wrist.x), float(left_wrist.y)),
@@ -258,6 +270,8 @@ class VisionTracker:
             actual_fps=self._actual_fps,
             inference_ms=inference_ms,
             gesture_candidate=gesture.candidate if gesture is not None else False,
+            gesture_left_raised=gesture.left_raised if gesture is not None else False,
+            gesture_right_raised=gesture.right_raised if gesture is not None else False,
             gesture_confidence=gesture.confidence if gesture is not None else 0.0,
             gesture_ms=gesture_ms,
         )

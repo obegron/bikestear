@@ -31,8 +31,8 @@ class AxisValue:
 @dataclass(frozen=True, slots=True)
 class GestureValue:
     enabled: bool = False
-    candidate: bool = False
-    active: bool = False
+    candidate: str | None = None
+    active: str | None = None
     held_ms: float = 0.0
     stale: bool = False
 
@@ -41,27 +41,44 @@ class GestureMapper:
     def __init__(self, config: VisionConfig) -> None:
         self.config = config
         self._candidate_since: float | None = None
+        self._candidate_action: str | None = None
+
+    def _action_for(self, sample: VisionResult) -> str | None:
+        if self.config.gesture == "wrist_raise":
+            return "accept" if sample.gesture_candidate else None
+        if sample.gesture_left_raised and sample.gesture_right_raised:
+            return "menu"
+        if sample.gesture_right_raised:
+            return "accept"
+        if sample.gesture_left_raised:
+            return "decline"
+        return None
 
     def update(self, sample: VisionResult | None, now: float) -> GestureValue:
         if self.config.gesture == "disabled":
             self._candidate_since = None
+            self._candidate_action = None
             return GestureValue(enabled=False)
         fresh = (
             sample is not None
             and (now - sample.ts) * 1000.0 <= self.config.gesture_stale_after_ms
             and sample.gesture_confidence >= self.config.min_confidence
         )
-        candidate = bool(fresh and sample is not None and sample.gesture_candidate)
-        if not candidate:
+        candidate = self._action_for(sample) if fresh and sample is not None else None
+        if candidate is None:
             self._candidate_since = None
+            self._candidate_action = None
             return GestureValue(enabled=True, stale=not fresh)
-        if self._candidate_since is None:
+        if candidate != self._candidate_action:
+            self._candidate_action = candidate
             self._candidate_since = now
+        assert self._candidate_since is not None
         held_ms = max(0.0, (now - self._candidate_since) * 1000.0)
+        hold_ms = self.config.gesture_menu_hold_ms if candidate == "menu" else self.config.gesture_hold_ms
         return GestureValue(
             enabled=True,
-            candidate=True,
-            active=held_ms >= self.config.gesture_hold_ms,
+            candidate=candidate,
+            active=candidate if held_ms >= hold_ms else None,
             held_ms=held_ms,
             stale=False,
         )

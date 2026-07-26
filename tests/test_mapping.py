@@ -102,6 +102,26 @@ class GestureMapperTests(unittest.TestCase):
             gesture_confidence=confidence,
         )
 
+    def button_mapper(self) -> GestureMapper:
+        return GestureMapper(VisionConfig(
+            min_confidence=0.5,
+            gesture="wrist_buttons",
+            gesture_hold_ms=400,
+            gesture_menu_hold_ms=900,
+            gesture_stale_after_ms=250,
+        ))
+
+    def button_sample(self, ts: float, *, left: bool = False, right: bool = False) -> VisionResult:
+        return VisionResult(
+            ts=ts,
+            torso_x=0.0,
+            confidence=1.0,
+            gesture_candidate=left or right,
+            gesture_left_raised=left,
+            gesture_right_raised=right,
+            gesture_confidence=0.9,
+        )
+
     def test_requires_configured_hold_before_pressing(self):
         mapper = self.mapper()
         self.assertFalse(mapper.update(self.sample(0.0), 0.0).active)
@@ -124,6 +144,23 @@ class GestureMapperTests(unittest.TestCase):
         stale = mapper.update(self.sample(0.4), 0.7)
         self.assertTrue(stale.stale)
         self.assertFalse(stale.active)
+
+    def test_wrist_buttons_map_right_accept_left_decline(self):
+        mapper = self.button_mapper()
+        mapper.update(self.button_sample(0.0, right=True), 0.0)
+        self.assertEqual(mapper.update(self.button_sample(0.4, right=True), 0.4).active, "accept")
+        mapper.update(self.button_sample(0.41), 0.41)
+        mapper.update(self.button_sample(0.5, left=True), 0.5)
+        self.assertEqual(mapper.update(self.button_sample(0.9, left=True), 0.9).active, "decline")
+
+    def test_both_wrists_are_exclusive_and_menu_uses_longer_hold(self):
+        mapper = self.button_mapper()
+        mapper.update(self.button_sample(0.0, right=True), 0.0)
+        switched = mapper.update(self.button_sample(0.3, left=True, right=True), 0.3)
+        self.assertEqual(switched.candidate, "menu")
+        self.assertIsNone(switched.active)
+        self.assertIsNone(mapper.update(self.button_sample(1.19, left=True, right=True), 1.19).active)
+        self.assertEqual(mapper.update(self.button_sample(1.21, left=True, right=True), 1.21).active, "menu")
 
 
 if __name__ == "__main__":

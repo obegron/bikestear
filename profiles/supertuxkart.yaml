@@ -8,6 +8,7 @@ vision:
   min_confidence: 0.5
   gesture: disabled
   gesture_hold_ms: 400
+  gesture_menu_hold_ms: 900
   gesture_raise_margin: 0.08
   gesture_stale_after_ms: 250
 
@@ -31,3 +32,5 @@ uinput:
   x_axis: ABS_X
   y_axis: ABS_Y
   accept_button: BTN_SOUTH
+  decline_button: BTN_WEST
+  menu_button: BTN_START

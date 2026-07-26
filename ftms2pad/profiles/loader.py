@@ -8,7 +8,7 @@ from typing import Any, TypeVar
 import yaml
 
 Y_SOURCES = frozenset({"speed_kph", "watts", "cadence_rpm"})
-GESTURES = frozenset({"disabled", "wrist_raise"})
+GESTURES = frozenset({"disabled", "wrist_raise", "wrist_buttons"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +20,7 @@ class VisionConfig:
     min_confidence: float = 0.5
     gesture: str = "disabled"
     gesture_hold_ms: float = 400.0
+    gesture_menu_hold_ms: float = 900.0
     gesture_raise_margin: float = 0.08
     gesture_stale_after_ms: float = 250.0
 
@@ -49,6 +50,8 @@ class UInputConfig:
     x_axis: str = "ABS_X"
     y_axis: str = "ABS_Y"
     accept_button: str = "BTN_SOUTH"
+    decline_button: str = "BTN_WEST"
+    menu_button: str = "BTN_START"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +122,8 @@ def _validate(profile: Profile) -> None:
         raise ValueError(f"Unknown vision.gesture '{vision.gesture}'; choose one of: {choices}")
     if number(vision.gesture_hold_ms, "vision.gesture_hold_ms") < 0.0:
         raise ValueError("vision.gesture_hold_ms must be at least 0")
+    if number(vision.gesture_menu_hold_ms, "vision.gesture_menu_hold_ms") < vision.gesture_hold_ms:
+        raise ValueError("vision.gesture_menu_hold_ms must be at least vision.gesture_hold_ms")
     if not 0.0 < number(vision.gesture_raise_margin, "vision.gesture_raise_margin") < 0.5:
         raise ValueError("vision.gesture_raise_margin must be greater than 0 and less than 0.5")
     if number(vision.gesture_stale_after_ms, "vision.gesture_stale_after_ms") <= 0.0:
@@ -159,8 +164,15 @@ def _validate(profile: Profile) -> None:
             raise ValueError(f"uinput.{field_name} must be a Linux ABS_* axis name")
     if profile.uinput.x_axis == profile.uinput.y_axis:
         raise ValueError("uinput.x_axis and uinput.y_axis must be different")
-    if not isinstance(profile.uinput.accept_button, str) or not profile.uinput.accept_button.startswith("BTN_"):
-        raise ValueError("uinput.accept_button must be a Linux BTN_* button name")
+    button_names = ("accept_button", "decline_button", "menu_button")
+    button_values: list[str] = []
+    for field_name in button_names:
+        value = getattr(profile.uinput, field_name)
+        if not isinstance(value, str) or not value.startswith("BTN_"):
+            raise ValueError(f"uinput.{field_name} must be a Linux BTN_* button name")
+        button_values.append(value)
+    if len(set(button_values)) != len(button_values):
+        raise ValueError("uinput accept, decline, and menu buttons must be different")
 
 
 def load_profile(profile: str, search_dir: Path | None = None) -> Profile:

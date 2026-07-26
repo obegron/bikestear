@@ -10,6 +10,8 @@ class FakeCodes:
     ABS_X = 0
     ABS_Y = 1
     BTN_SOUTH = 304
+    BTN_WEST = 307
+    BTN_START = 315
 
 
 class FakeDevice:
@@ -35,15 +37,28 @@ class VirtualGamepadTests(unittest.TestCase):
             patch.object(gamepad, "AbsInfo", lambda **values: values),
             patch.object(gamepad, "UInput", FakeDevice),
         ):
-            device = gamepad.VirtualGamepad("ABS_X", "ABS_Y", "BTN_SOUTH")
-            self.assertEqual(device._device.events[FakeCodes.EV_KEY], [FakeCodes.BTN_SOUTH])
+            device = gamepad.VirtualGamepad("ABS_X", "ABS_Y", "BTN_SOUTH", "BTN_WEST", "BTN_START")
+            backend = device._device
+            self.assertEqual(
+                backend.events[FakeCodes.EV_KEY],
+                [FakeCodes.BTN_SOUTH, FakeCodes.BTN_WEST, FakeCodes.BTN_START],
+            )
 
-            device.emit(0.0, 0.0, True)
-            device.emit(0.0, 0.0, True)
-            device.emit(0.0, 0.0, False)
+            device.emit(0.0, 0.0, accept=True)
+            device.emit(0.0, 0.0, accept=True)
+            device.emit(0.0, 0.0, decline=True)
+            device.emit(0.0, 0.0, menu=True)
+            device.emit(0.0, 0.0)
 
-            button_writes = [value for event_type, code, value in device._device.writes if event_type == 1]
-            self.assertEqual(button_writes, [1, 0])
+            button_writes = [(code, value) for event_type, code, value in backend.writes if event_type == 1]
+            self.assertEqual(button_writes, [
+                (FakeCodes.BTN_SOUTH, 1),
+                (FakeCodes.BTN_SOUTH, 0),
+                (FakeCodes.BTN_WEST, 1),
+                (FakeCodes.BTN_WEST, 0),
+                (FakeCodes.BTN_START, 1),
+                (FakeCodes.BTN_START, 0),
+            ])
             device.close()
 
 

@@ -62,10 +62,10 @@ def _status_line(state: RuntimeState, source: str, now: float) -> str:
         gesture = "off"
     elif state.gesture.stale:
         gesture = "stale"
-    elif state.gesture.active:
-        gesture = "PRESSED"
+    elif state.gesture.active is not None:
+        gesture = f"{state.gesture.active.upper()} PRESSED"
     elif state.gesture.candidate:
-        gesture = f"hold {state.gesture.held_ms:.0f}ms"
+        gesture = f"hold {state.gesture.candidate} {state.gesture.held_ms:.0f}ms"
     else:
         gesture = "ready"
     return (
@@ -96,6 +96,8 @@ async def run_controller(
         profile.uinput.x_axis,
         profile.uinput.y_axis,
         profile.uinput.accept_button,
+        profile.uinput.decline_button,
+        profile.uinput.menu_button,
     )
     if gamepad is not None and not gamepad.enabled:
         raise RuntimeError(f"Could not create virtual gamepad ({gamepad.error}). Check /dev/uinput permissions.")
@@ -114,7 +116,13 @@ async def run_controller(
             packet, _ = worker.latest()
             _advance_mappers(state, x_mapper, y_mapper, gesture_mapper, packet, now)
             if gamepad is not None:
-                gamepad.emit(state.x.mapped, state.y.mapped, state.gesture.active)
+                gamepad.emit(
+                    state.x.mapped,
+                    state.y.mapped,
+                    accept=state.gesture.active == "accept",
+                    decline=state.gesture.active == "decline",
+                    menu=state.gesture.active == "menu",
+                )
             if worker.error is not None and not warned_vision:
                 print(f"\nVision worker stopped: {worker.error}. X will return to neutral; Y remains active.")
                 warned_vision = True
@@ -162,9 +170,10 @@ def draw_monitor_frame(frame, state: RuntimeState, source: str, now: float, mirr
                 cv2.circle(display, value, 4, (80, 190, 255), -1)
     gesture_estimate = state.vision.gesture if state.vision is not None else None
     if gesture_estimate is not None:
-        for wrist_value in gesture_estimate.wrists:
+        raised = (gesture_estimate.left_raised, gesture_estimate.right_raised)
+        for wrist_value, wrist_raised in zip(gesture_estimate.wrists, raised):
             wrist = point(wrist_value)
-            wrist_color = (90, 255, 120) if gesture_estimate.candidate else (180, 180, 90)
+            wrist_color = (90, 255, 120) if wrist_raised else (180, 180, 90)
             cv2.circle(display, wrist, 6, wrist_color, 2)
 
     result = state.vision.result if state.vision is not None else None
@@ -178,10 +187,10 @@ def draw_monitor_frame(frame, state: RuntimeState, source: str, now: float, mirr
         gesture_text = "disabled"
     elif state.gesture.stale:
         gesture_text = "stale / released"
-    elif state.gesture.active:
-        gesture_text = "BTN_SOUTH pressed"
+    elif state.gesture.active is not None:
+        gesture_text = f"{state.gesture.active} button pressed"
     elif state.gesture.candidate:
-        gesture_text = f"holding {state.gesture.held_ms:.0f} ms"
+        gesture_text = f"holding {state.gesture.candidate} {state.gesture.held_ms:.0f} ms"
     else:
         gesture_text = "ready"
     lines = (
